@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "bs_mapping_data",
+    "beatmap_core_proc",
+    "beatmap_core",
+]
+resolver = "3"
+
+
+[profile.release]
+opt-level = 3
