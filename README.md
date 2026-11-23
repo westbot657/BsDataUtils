@@ -10,14 +10,14 @@ Represents every file format as rust enums and structs.
 
 This includes:
 - Info
-  - V2
+  - V2 (Including CustomData for SongCore, SettingsSetter, Beatcraft)
   - V4
 - Audio Info
   - V2
   - V4
 - Beatmap
-  - V2
-  - V3
+  - V2 (Including CustomData for Tracks, Noodle, Chroma)
+  - V3 (Including CustomData for Tracks, Noodle, Chroma)
   - V4
 - Lightshow
   - V4
