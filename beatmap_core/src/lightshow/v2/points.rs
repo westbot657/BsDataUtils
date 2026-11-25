@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use crate::tracks::{points::Angle, TimeSpan, Event, Point, Timeable};
+use crate::tracks::{points::Angle, TimeSpan, Event, Point, Timeable, CascadingUpdate};
 use crate::{timed, ColorScheme, RuntimeData};
 use glam::{FloatExt, Vec4};
 use tiny_vec::TinyVec;
@@ -263,6 +263,12 @@ pub struct RingRotationEvent {
 }
 
 timed!(event RingRotationEvent: RingRotationPointValue);
+
+impl CascadingUpdate for RingRotationEvent {
+    fn cascade(&mut self, beat: f32, previous: &Self, previous_beat: f32) {
+        todo!()
+    }
+}
 
 impl Event for RingRotationEvent {
     type Point = RingRotationPoint;
