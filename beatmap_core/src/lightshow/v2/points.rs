@@ -225,6 +225,33 @@ impl Point for LightPoint {
 }
 
 /// WIP
+
+#[derive(Clone, Copy)]
+pub enum RingRotationPointValue {
+    NormalizedValueIndex(f32),
+    Angle(Angle),
+}
+
+impl Default for RingRotationPointValue {
+    fn default() -> Self {
+        Self::NormalizedValueIndex(0.)
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct RingRotationPoint {
+    pub value: RingRotationPointValue,
+    pub easing_from_last: Easing,
+}
+
+impl Point for RingRotationPoint {
+    fn interpolate(&self, next: &Self, span: TimeSpan, rt: &RuntimeData) -> Self::State {
+        todo!()
+    }
+}
+
+timed!(point RingRotationPoint: RingRotationPointValue);
+
 #[derive(Clone, Default)]
 pub struct RingRotationEvent {
     /// requires pre-comp based on ring index and propagation speed
@@ -232,13 +259,13 @@ pub struct RingRotationEvent {
     /// how long after it starts spinning, to reach the end.
     pub spin_time: f32,
     /// calculating what this is meant to be is really difficult dut to how rings work
-    pub angle: Angle,
+    pub angle: RingRotationPointValue,
 }
 
-timed!(event RingRotationEvent: f32);
+timed!(event RingRotationEvent: RingRotationPointValue);
 
 impl Event for RingRotationEvent {
-    type Point = F32Point;
+    type Point = RingRotationPoint;
     fn get_points<'e, Timed: Timeable<Data = Self>>(
         &'e self,
         event_beat: f32,
@@ -246,9 +273,9 @@ impl Event for RingRotationEvent {
         _rt: &RuntimeData,
     ) -> TinyVec<(f32, Cow<'e, Self::Point>), 4> {
         TinyVec::from_array([
-            (event_beat, Cow::Owned(F32Point { v: previous.data().angle.to_radians(), easing_from_last: Easing::easeStep })),
-            (event_beat + self.start_time, Cow::Owned(F32Point { v: previous.data().angle.to_radians(), easing_from_last: Easing::easeStep })),
-            (event_beat + self.start_time + self.spin_time, Cow::Owned(F32Point { v: self.angle.to_radians(), easing_from_last: Easing::easeOutExpo })),
+            (event_beat, Cow::Owned(RingRotationPoint { value: previous.data().angle, easing_from_last: Easing::easeStep })),
+            (event_beat + self.start_time, Cow::Owned(RingRotationPoint { value: previous.data().angle, easing_from_last: Easing::easeStep })),
+            (event_beat + self.start_time + self.spin_time, Cow::Owned(RingRotationPoint { value: self.angle, easing_from_last: Easing::easeOutExpo })),
         ])
     }
 }

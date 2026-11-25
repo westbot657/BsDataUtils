@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use beatmap_core_proc::hex;
 use bs_mapping_data::BpmRegion;
 use beatmap::{Arc, BombNote, ChainNote, ColorNote, Obstacle};
-use glam::{Vec3, Vec4, FloatExt};
+use glam::{Vec3, Vec4, FloatExt, UVec4};
 use tracks_rs::prelude::*;
 
 use tracks_rs::animation::timeline_coroutine_manager::TimelineCoroutineManager;
@@ -209,6 +209,131 @@ impl Default for ColorScheme {
         }
     }
 }
+
+
+pub trait UnityRandomType {
+    fn next(u: &mut UnityRandom) -> Self;
+    fn range(u: &mut UnityRandom, a: Self, b: Self) -> Self;
+}
+
+/// Cloning this will not reset the random state, both UnityRandoms will produce identical values
+#[derive(Clone, Debug)]
+pub struct UnityRandom {
+    state: UVec4,
+}
+
+impl UnityRandom {
+    pub fn new(seed: u32) -> Self {
+        let state = UVec4::new(
+            seed,
+            362436069,
+            521288629,
+            88675123,
+        );
+        let mut s = Self { state };
+
+        for _ in 0..16 {
+            s.next::<u32>();
+        }
+
+        s
+    }
+
+    pub fn next<T: UnityRandomType>(&mut self) -> T {
+        T::next(self)
+    }
+
+    pub fn range<T: UnityRandomType>(&mut self, a: T, b: T) -> T {
+        T::range(self, a, b)
+    }
+
+    pub fn shuffle<T>(&mut self, mut list: Vec<T>) -> Vec<T> {
+        let mut out = Vec::with_capacity(list.len());
+        for _ in 0..list.len() {
+            let next = self.range(0, list.len() as u32);
+            out.push(list.remove(next as usize));
+        }
+        out
+    }
+
+}
+
+impl UnityRandomType for u32 {
+    fn next(u: &mut UnityRandom) -> Self {
+        let [x, y, z, w] = u.state.to_array();
+        let t = x ^ (x << 11);
+        u.state = UVec4::new(
+            y,
+            z,
+            w,
+            w ^ (w >> 19) ^ t ^ (t >> 8),
+        );
+        u.state.w
+    }
+
+    fn range(u: &mut UnityRandom, a: Self, b: Self) -> Self {
+        if a >= b { return a };
+        let t = Self::next(u);
+        let range = b - a;
+        a + ((t & 0xFFFFFFFF) % range)
+    }
+}
+
+impl UnityRandomType for f32 {
+    fn next(u: &mut UnityRandom) -> Self {
+        (u.next::<u32>() & 0xFFFFFF) as f32 / 0x1_000_000 as f32
+    }
+
+    fn range(u: &mut UnityRandom, a: Self, b: Self) -> Self {
+        a + (b - a) * Self::next(u)
+    }
+}
+
+pub trait PseudoRandomType {
+    fn rand(self) -> u32;
+}
+
+pub fn pseudo_random(r: impl PseudoRandomType) -> f32 {
+    (r.rand() & 0xFFFFFF) as f32 / 0x1000000 as f32
+}
+
+fn mix(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846ca68b);
+    x ^= x >> 16;
+    x
+}
+
+impl PseudoRandomType for u32 {
+    fn rand(self) -> u32 {
+        mix(self)
+    }
+}
+impl PseudoRandomType for f32 {
+    fn rand(self) -> u32 {
+        let u = self.to_bits();
+        u.rand()
+    }
+}
+
+macro_rules! pseudo_tuple {
+    ($($v:tt, $n:tt),*) => {
+        impl<$($v: PseudoRandomType),*> PseudoRandomType for ($($v),*) {
+            fn rand(self) -> u32 {
+                let mut h = 0x9E3779B9u32;
+                $( h = mix(h.rotate_left(5) ^ self.$n.rand()); )*
+                h
+            }
+        }
+    };
+}
+
+pseudo_tuple!(A, 0, B, 1);
+pseudo_tuple!(A, 0, B, 1, C, 2);
+pseudo_tuple!(A, 0, B, 1, C, 2, D, 3);
+pseudo_tuple!(A, 0, B, 1, C, 2, D, 3, E, 4);
 
 
 

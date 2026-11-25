@@ -85,7 +85,9 @@ pub struct LightshowV2Controller {
     pub back_lasers: TrackSet<Timed<LightPoint>>,
     pub center_lasers: TrackSet<Timed<LightPoint>>,
 
+    ///
     pub ring_zoom: TrackSet<Timed<F32Point>>,
+    /// Unfortunately this one track will require full rebuilds
     pub ring_rotation: TrackSet<CacheableTimed<RingRotationEvent>>,
 }
 
