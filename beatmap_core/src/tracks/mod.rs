@@ -30,6 +30,7 @@ pub enum TrackSetInsertionError {
     InvalidId { max: usize, id: usize },
 }
 
+
 // Helpers
 /// Handles base interpolation animation between points.
 pub(crate) fn animate_timed<P: Point, T: Timeable<Data = P>>(
@@ -103,6 +104,7 @@ fn track_insert<T: Timeable>(
         })
     }
 }
+
 
 // Traits
 /// Represents an Animator over data.
@@ -225,6 +227,7 @@ pub trait Cascader {
     fn get_mut(data: &mut [Self::Timeable], index: usize) -> Option<Self::MutRef<'_>>;
     fn cascade(data: &mut [Self::Timeable], index: usize);
 }
+
 
 // Structs
 /// Represents the span between 2 points and the current time.
@@ -351,6 +354,7 @@ pub struct UninitializedTrackSet<C: Cascader> {
     // have this value anyways since it comes from them
     last_beat: f32,
 }
+
 
 // Implementations
 impl TimeSpan {
@@ -991,6 +995,7 @@ impl<C: Cascader> UninitializedTrackSet<C> {
         TrackSet::from_vecs(self.tracks, self.last_beat)
     }
 }
+
 
 // Macros
 /// Simplifies implementing TimedData for types.
