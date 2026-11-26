@@ -358,6 +358,7 @@ pub struct UninitializedTrackSet<C: Cascader> {
     last_beat: f32,
 }
 
+
 // Implementations
 impl TimeSpan {
     pub fn new(now: Now, start: f32, end: f32) -> Self {
