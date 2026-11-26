@@ -30,10 +30,9 @@ pub enum TrackSetInsertionError {
     InvalidId { max: usize, id: usize },
 }
 
-
 // Helpers
 /// Handles base interpolation animation between points.
-pub(crate) fn animate_timed<P: Point, T: Timeable<Data =P>>(
+pub(crate) fn animate_timed<P: Point, T: Timeable<Data = P>>(
     default: &T,
     data: &[T],
     last_beat: f32,
@@ -56,7 +55,8 @@ pub(crate) fn animate_timed<P: Point, T: Timeable<Data =P>>(
         }
     };
 
-    a.data().interpolate(b.data(), TimeSpan::new(now, a.beat(), b.beat()), rt)
+    a.data()
+        .interpolate(b.data(), TimeSpan::new(now, a.beat(), b.beat()), rt)
 }
 
 /// invalidates `i`+1. `i` is left alone since it's assumed to get invalidated by
@@ -104,17 +104,10 @@ fn track_insert<T: Timeable>(
     }
 }
 
-
 // Traits
 /// Represents an Animator over data.
 pub trait Animator<D: TimedData, T: Timeable<Data = D>> {
-    fn animate(
-        default: &T,
-        track: &[T],
-        last_beat: f32,
-        now: Now,
-        rt: &RuntimeData,
-    ) -> D::State;
+    fn animate(default: &T, track: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> D::State;
 }
 
 /// Represents a type that sits at a point in time.
@@ -226,11 +219,12 @@ pub trait CascadingUpdate: TimedData {
 /// a dummy wrapper.
 pub trait Cascader {
     type Timeable: Timeable;
-    type MutRef<'c> where Self::Timeable: 'c;
+    type MutRef<'c>
+    where
+        Self::Timeable: 'c;
     fn get_mut(data: &mut [Self::Timeable], index: usize) -> Option<Self::MutRef<'_>>;
     fn cascade(data: &mut [Self::Timeable], index: usize);
 }
-
 
 // Structs
 /// Represents the span between 2 points and the current time.
@@ -358,7 +352,6 @@ pub struct UninitializedTrackSet<C: Cascader> {
     last_beat: f32,
 }
 
-
 // Implementations
 impl TimeSpan {
     pub fn new(now: Now, start: f32, end: f32) -> Self {
@@ -424,25 +417,13 @@ impl<'d, P: Point> Point for Cow<'d, P> {
 }
 
 impl<P: Point, T: Timeable<Data = P>> Animator<P, T> for PointAnimator<P> {
-    fn animate(
-        default: &T,
-        data: &[T],
-        last_beat: f32,
-        now: Now,
-        rt: &RuntimeData,
-    ) -> P::State {
+    fn animate(default: &T, data: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> P::State {
         animate_timed(default, data, last_beat, now, rt)
     }
 }
 
 impl<E: Event, T: Timeable<Data = E>> Animator<E, T> for EventAnimator<E> {
-    fn animate(
-        default: &T,
-        data: &[T],
-        last_beat: f32,
-        now: Now,
-        rt: &RuntimeData,
-    ) -> E::State {
+    fn animate(default: &T, data: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> E::State {
         let i = data.partition_point(|e| e.beat() <= now.beat);
 
         let a = match i.checked_sub(2) {
@@ -457,39 +438,22 @@ impl<E: Event, T: Timeable<Data = E>> Animator<E, T> for EventAnimator<E> {
             // Empty event list
             (None, None) => {
                 let default_point = Timed::new(default_point, 0.);
-                animate_timed(
-                    &default_point,
-                    &[],
-                    last_beat,
-                    now,
-                    rt
-                )
+                animate_timed(&default_point, &[], last_beat, now, rt)
             }
             // first or last event, `a` is default when first event,
             // and the previous event when last
             (None, Some(e)) | (Some(e), None) => {
-                let default_point = Timed::new(
-                    Cow::Owned(default_point),
-                    0.
-                );
+                let default_point = Timed::new(Cow::Owned(default_point), 0.);
                 let points = e.get_points(a, rt);
-                let points: TinyVec<_, 4> = points.into_iter()
+                let points: TinyVec<_, 4> = points
+                    .into_iter()
                     .map(|(beat, data)| Timed::new(data, beat))
                     .collect();
-                animate_timed(
-                    &default_point,
-                    points.as_slice(),
-                    last_beat,
-                    now,
-                    rt
-                )
+                animate_timed(&default_point, points.as_slice(), last_beat, now, rt)
             }
             // between 2 events
             (Some(b), Some(c)) => {
-                let default_point = Timed::new(
-                    Cow::Owned(default_point),
-                    0.
-                );
+                let default_point = Timed::new(Cow::Owned(default_point), 0.);
 
                 let b_points = b.get_points(a, rt);
                 debug_assert!(
@@ -515,23 +479,17 @@ impl<E: Event, T: Timeable<Data = E>> Animator<E, T> for EventAnimator<E> {
                     std::any::type_name::<E>()
                 );
 
-                let cutoff = c_points.first()
-                    .map_or(f32::INFINITY, |(beat, _)| *beat);
+                let cutoff = c_points.first().map_or(f32::INFINITY, |(beat, _)| *beat);
                 let b_points = E::clip(b_points, cutoff, rt);
 
-                let points: TinyVec<_, 8> = b_points.into_iter()
+                let points: TinyVec<_, 8> = b_points
+                    .into_iter()
                     .filter(|(beat, _)| *beat <= cutoff)
                     .chain(c_points.into_iter())
                     .map(|(beat, data)| Timed::new(data, beat))
                     .collect();
 
-                animate_timed(
-                    &default_point,
-                    points.as_slice(),
-                    last_beat,
-                    now,
-                    rt
-                )
+                animate_timed(&default_point, points.as_slice(), last_beat, now, rt)
             }
         }
     }
@@ -615,7 +573,8 @@ impl<E: Event> Timeable for CacheableTimed<E> {
         Self::Data: Event,
     {
         let cached = self.cache.get_or_init(|| {
-            self.data.get_points(self.beat, previous, rt)
+            self.data
+                .get_points(self.beat, previous, rt)
                 .into_iter()
                 .map(|(b, c)| (b, c.into_owned()))
                 .collect::<Box<[_]>>()
@@ -634,7 +593,10 @@ impl<E: Event> Timeable for CacheableTimed<E> {
 
 impl<T: Timeable<Data: CascadingUpdate>> Cascader for Cascade<T> {
     type Timeable = T;
-    type MutRef<'c> = CascadeMutGuard<'c, T> where T: 'c;
+    type MutRef<'c>
+        = CascadeMutGuard<'c, T>
+    where
+        T: 'c;
     fn get_mut(data: &mut [T], index: usize) -> Option<Self::MutRef<'_>> {
         if index < data.len() {
             Some(CascadeMutGuard {
@@ -650,7 +612,9 @@ impl<T: Timeable<Data: CascadingUpdate>> Cascader for Cascade<T> {
     /// previous element.
     fn cascade(data: &mut [T], index: usize) {
         for i in index..data.len() {
-            let [a, b] = &mut data[i.saturating_sub(1)..=i] else { continue };
+            let [a, b] = &mut data[i.saturating_sub(1)..=i] else {
+                continue;
+            };
             b.invalidate_cache();
             let b_beat = b.beat();
             b.data_mut().cascade(b_beat, a.data(), a.beat());
@@ -719,7 +683,10 @@ impl<C: Cascader> Track<C> {
         Self::from_vec(Vec::new(), last_beat)
     }
 
-    pub fn from_unordered(data: Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>, last_beat: f32) -> Self {
+    pub fn from_unordered(
+        data: Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>,
+        last_beat: f32,
+    ) -> Self {
         let data = data
             .into_iter()
             .map(|u| <C::Timeable>::new(u.data, u.beat))
@@ -738,7 +705,11 @@ impl<C: Cascader> Track<C> {
         }
     }
 
-    pub fn animate(&self, now: Now, rt: &RuntimeData) -> <<C::Timeable as Timeable>::Data as TimedData>::State {
+    pub fn animate(
+        &self,
+        now: Now,
+        rt: &RuntimeData,
+    ) -> <<C::Timeable as Timeable>::Data as TimedData>::State {
         <<C::Timeable as Timeable>::Data as TimedData>::Animator::animate(
             &self.default,
             &self.data,
@@ -748,7 +719,11 @@ impl<C: Cascader> Track<C> {
         )
     }
 
-    pub fn insert(&mut self, beat: f32, data: <C::Timeable as Timeable>::Data) -> Result<(), TrackInsertionError> {
+    pub fn insert(
+        &mut self,
+        beat: f32,
+        data: <C::Timeable as Timeable>::Data,
+    ) -> Result<(), TrackInsertionError> {
         let i = track_insert(&mut self.data, self.last_beat, beat, data)?;
         C::cascade(&mut self.data, i);
         Ok(())
@@ -794,7 +769,10 @@ impl<C: Cascader> TrackSet<C> {
         }
     }
 
-    pub fn from_unordered(data: Vec<Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>>, last_beat: f32) -> Self {
+    pub fn from_unordered(
+        data: Vec<Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>>,
+        last_beat: f32,
+    ) -> Self {
         let data = data
             .into_iter()
             .map(|d| {
@@ -826,13 +804,15 @@ impl<C: Cascader> TrackSet<C> {
         rt: &RuntimeData,
     ) -> Option<<<C::Timeable as Timeable>::Data as TimedData>::State> {
         let track = self.tracks.get(track)?;
-        Some(<<C::Timeable as Timeable>::Data as TimedData>::Animator::animate(
-            &self.default,
-            track,
-            self.last_beat,
-            now,
-            rt,
-        ))
+        Some(
+            <<C::Timeable as Timeable>::Data as TimedData>::Animator::animate(
+                &self.default,
+                track,
+                self.last_beat,
+                now,
+                rt,
+            ),
+        )
     }
 
     /// Note: if the track set has fewer tracks than the frame expects, this creates a default
@@ -922,7 +902,11 @@ impl<C: Cascader> TrackSet<C> {
         C::get_mut(track, index)
     }
 
-    pub fn remove(&mut self, track: usize, index: usize) -> Option<(f32, <C::Timeable as Timeable>::Data)> {
+    pub fn remove(
+        &mut self,
+        track: usize,
+        index: usize,
+    ) -> Option<(f32, <C::Timeable as Timeable>::Data)> {
         let track = self.tracks.get_mut(track)?;
         if index >= track.len() {
             None
@@ -944,7 +928,10 @@ impl<C: Cascader> TrackSet<C> {
 
 impl<C: Cascader> UninitializedTrack<C> {
     pub fn new(last_beat: f32) -> Self {
-        Self { data: Vec::new(), last_beat }
+        Self {
+            data: Vec::new(),
+            last_beat,
+        }
     }
 
     pub fn add(
@@ -964,10 +951,7 @@ impl<C: Cascader> UninitializedTrack<C> {
     }
 
     pub fn finalize(self) -> Track<C> {
-        Track::from_vec(
-            self.data,
-            self.last_beat,
-        )
+        Track::from_vec(self.data, self.last_beat)
     }
 }
 
@@ -975,7 +959,7 @@ impl<C: Cascader> UninitializedTrackSet<C> {
     pub fn new(tracks: usize, last_beat: f32) -> Self {
         Self {
             tracks: (0..tracks).map(|_| Vec::new()).collect(),
-            last_beat
+            last_beat,
         }
     }
 
@@ -1008,7 +992,6 @@ impl<C: Cascader> UninitializedTrackSet<C> {
     }
 }
 
-
 // Macros
 /// Simplifies implementing TimedData for types.
 /// Usage:
@@ -1020,15 +1003,15 @@ impl<C: Cascader> UninitializedTrackSet<C> {
 macro_rules! timed {
     (event $name:ident: $state:ty) => {
         impl $crate::tracks::TimedData for $name {
-            type Animator<T: $crate::tracks::Timeable<Data=Self>>
-                = $crate::tracks::EventAnimator<Self>;
+            type Animator<T: $crate::tracks::Timeable<Data = Self>> =
+                $crate::tracks::EventAnimator<Self>;
             type State = $state;
         }
     };
     (point $name:ident: $state:ty) => {
         impl $crate::tracks::TimedData for $name {
-            type Animator<T: $crate::tracks::Timeable<Data=Self>>
-                = $crate::tracks::PointAnimator<Self>;
+            type Animator<T: $crate::tracks::Timeable<Data = Self>> =
+                $crate::tracks::PointAnimator<Self>;
             type State = $state;
         }
     };
