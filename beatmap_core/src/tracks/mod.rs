@@ -24,7 +24,7 @@ pub struct TrackInsertionError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum TrackSetInsertionError {
-    #[error("{0}")]
+    #[error(transparent)]
     OutOfBounds(#[from] TrackInsertionError),
     #[error("invalid object id: {id} expected 0..{max}")]
     InvalidId { max: usize, id: usize },
@@ -56,8 +56,7 @@ pub(crate) fn animate_timed<P: Point, T: Timeable<Data =P>>(
         }
     };
 
-    a.data()
-        .interpolate(b.data(), TimeSpan::new(now, a.beat(), b.beat()), rt)
+    a.data().interpolate(b.data(), TimeSpan::new(now, a.beat(), b.beat()), rt)
 }
 
 /// invalidates `i`+1. `i` is left alone since it's assumed to get invalidated by
@@ -69,7 +68,7 @@ fn invalidate_neighbors<T: Timeable>(list: &mut [T], i: usize) {
 }
 
 /// Clips any Data outside the song range and logs warnings.
-fn clip_vec<D: TimedData, T: Timeable<Data = D>>(data: &mut Vec<T>, last_beat: f32) {
+fn clip_vec<T: Timeable>(data: &mut Vec<T>, last_beat: f32) {
     #[cfg(feature = "tracing")]
     let l = data.len();
 
@@ -84,11 +83,11 @@ fn clip_vec<D: TimedData, T: Timeable<Data = D>>(data: &mut Vec<T>, last_beat: f
 }
 
 /// Handles insertion logic for both Track and TrackSet
-fn track_insert<D: TimedData, T: Timeable<Data = D>>(
+fn track_insert<T: Timeable>(
     list: &mut Vec<T>,
     last_beat: f32,
     beat: f32,
-    data: D,
+    data: T::Data,
 ) -> Result<usize, TrackInsertionError> {
     if (0f32..=last_beat).contains(&beat) {
         let i = list.partition_point(|p| p.beat() <= beat);
@@ -132,7 +131,7 @@ pub trait TimedData: Clone + Default {
 }
 
 /// Points are interpolated to determine the State at the given time.
-/// Points can read the point directly ahead of itself to determine it's output state.
+/// Points can read the point directly ahead of itself to determine its output state.
 pub trait Point: TimedData {
     /// interpolates between this point and the next point.
     fn interpolate(&self, next: &Self, span: TimeSpan, runtime_data: &RuntimeData) -> Self::State;
@@ -221,19 +220,17 @@ pub trait CascadingUpdate: TimedData {
     fn cascade(&mut self, beat: f32, previous: &Self, previous_beat: f32);
 }
 
-pub(crate) trait PrivateTrackLike<T: Timeable> {
-    fn from_vec(data: Vec<T>, last_beat: f32) -> Self;
+/// Indicates the cascading behavior of a Track/TrackSet.
+/// The Timed and CacheableTimed types implement this
+/// so that you can provide them directly without needing
+/// a dummy wrapper.
+pub trait Cascader {
+    type Timeable: Timeable;
+    type MutRef<'c> where Self::Timeable: 'c;
+    fn get_mut(data: &mut [Self::Timeable], index: usize) -> Option<Self::MutRef<'_>>;
+    fn cascade(data: &mut [Self::Timeable], index: usize);
 }
 
-#[allow(private_bounds)]
-pub trait TrackLike<T: Timeable>: PrivateTrackLike<T> {}
-
-pub(crate) trait PrivateTrackSetLike<T: Timeable> {
-    fn from_vecs(data: Vec<Vec<T>>, last_beat: f32) -> Self;
-}
-
-#[allow(private_bounds)]
-pub trait TrackSetLike<T: Timeable>: PrivateTrackSetLike<T> {}
 
 // Structs
 /// Represents the span between 2 points and the current time.
@@ -262,29 +259,37 @@ pub struct PointAnimator<P: Point>(PhantomData<P>);
 /// First queries points from 2 target events, and then defers to PointAnimator.
 pub struct EventAnimator<E: Event>(PhantomData<E>);
 
-#[repr(C)]
+/// Represents a piece of data at a given time,
+/// but doesn't guarantee that a Vec<UnorderedTimed<D>>
+/// is always in chronological order.
 pub struct UnorderedTimed<D: TimedData> {
     pub data: D,
     pub beat: f32,
 }
 
-/// Simple timing wrapper, usable with both Points and Events.
-#[repr(C)]
+/// Represents a piece of data at a given time.
+/// Usable with both Points and Events.
 pub struct Timed<D: TimedData> {
     pub data: D,
     beat: f32,
 }
 
-/// Caching timing wrapper, only usable with Events, and caches the points from get_points
+/// Represents a piece of data at a given time.
+/// Only usable with Events, and caches the points from get_points
 /// to avoid repeated calculations.
 pub struct CacheableTimed<E: Event> {
     data: E,
     beat: f32,
     // Box requires an allocation, but only requires it once, and gives the benefit
     // of a smaller struct and faster reading when not looking up cache.
-    // Weather this is actually more useful is entirely dependent on the size of E::Point.
+    // Whether this is actually more useful is entirely dependent on the size of E::Point.
     cache: OnceCell<Box<[(f32, E::Point)]>>,
 }
+
+/// Marker type that indicates that a Track/TrackSet
+/// will need to do cascading updates whenever data
+/// is modified.
+pub struct Cascade<T: Timeable>(PhantomData<fn() -> T>);
 
 /// Holds a single animation track.
 ///
@@ -296,11 +301,23 @@ pub struct CacheableTimed<E: Event> {
 ///
 /// CacheableTimed<D> is only recommended if the Event you're using has a get_points implementation
 /// that requires a lot of calculations or allocates memory.
-pub struct Track<T: Timeable> {
-    data: Vec<T>,
+///
+/// `C` can be any of:
+/// `Cascade<Timed<T>>` which cascades, and doesn't cache.
+/// `Cascade<CacheableTimed<T>>` which cascades and caches.
+/// `Timed<T>` which doesn't cascade or cache.
+/// `CacheableTimed<T>` which caches and doesn't cascade.
+///
+/// cascading means that when a data point is modified,
+/// it and all following data points are updated iteratively.
+///
+/// cacheable (for events only) means an event's points will
+/// only recompute when the event is modified.
+pub struct Track<C: Cascader> {
+    data: Vec<C::Timeable>,
     /// Holds a cached default element for interpolating when the data list
-    /// is empty or is animating before it's first element
-    default: T,
+    /// is empty or is animating before its first element
+    default: C::Timeable,
     // only needed internally, the user should already
     // have this value anyways since it comes from them
     last_beat: f32,
@@ -308,44 +325,38 @@ pub struct Track<T: Timeable> {
 
 /// Holds a set of animation tracks.
 ///
-/// See Track<T> for more detail.
-pub struct TrackSet<T: Timeable> {
-    tracks: Vec<Vec<T>>,
+/// See Track<C> for more detail.
+pub struct TrackSet<C: Cascader> {
+    tracks: Vec<Vec<C::Timeable>>,
     /// Holds a cached default element for interpolating when the data list
-    /// is empty or is animating before it's first element
-    default: T,
+    /// is empty or is animating before its first element
+    default: C::Timeable,
     // only needed internally, the user should already
     // have this value anyways since it comes from them
     last_beat: f32,
 }
 
-pub struct UninitializedTrack<T: Timeable> {
-    data: Vec<T>,
+pub struct CascadeMutGuard<'c, T: 'c + Timeable<Data: CascadingUpdate>> {
+    track: &'c mut [T],
+    index: usize,
+    dirty: bool,
+}
+
+/// Track builder for adding data elements quickly,
+/// and sorting at finalization time.
+pub struct UninitializedTrack<C: Cascader> {
+    data: Vec<C::Timeable>,
     last_beat: f32,
 }
 
-/// TrackSet builder for adding data elements quickly, and sorting at finalization time.
-pub struct UninitializedTrackSet<T: Timeable> {
-    tracks: Vec<Vec<T>>,
+/// TrackSet builder for adding data elements quickly,
+/// and sorting at finalization time.
+pub struct UninitializedTrackSet<C: Cascader> {
+    tracks: Vec<Vec<C::Timeable>>,
     // only needed internally, the user should already
     // have this value anyways since it comes from them
     last_beat: f32,
 }
-
-/// Like a Track, but modifying the data will cause all trailing data to update.
-pub struct CascadeTrack<T: Timeable<Data: CascadingUpdate>> {
-    data: Vec<T>,
-    default: T,
-    last_beat: f32,
-}
-
-/// Like a TrackSet but modifying data causes trailing data to update.
-pub struct CascadeTrackSet<T: Timeable<Data: CascadingUpdate>> {
-    tracks: Vec<Vec<T>>,
-    default: T,
-    last_beat: f32,
-}
-
 
 // Implementations
 impl TimeSpan {
@@ -620,8 +631,86 @@ impl<E: Event> Timeable for CacheableTimed<E> {
     }
 }
 
-impl<T: Timeable> Track<T> {
-    pub fn new(last_beat: f32) -> UninitializedTrack<T> {
+impl<T: Timeable<Data: CascadingUpdate>> Cascader for Cascade<T> {
+    type Timeable = T;
+    type MutRef<'c> = CascadeMutGuard<'c, T> where T: 'c;
+    fn get_mut(data: &mut [T], index: usize) -> Option<Self::MutRef<'_>> {
+        if index < data.len() {
+            Some(CascadeMutGuard {
+                track: data,
+                index,
+                dirty: false,
+            })
+        } else {
+            None
+        }
+    }
+    /// Recomputes every element from `data[index..]` against the
+    /// previous element.
+    fn cascade(data: &mut [T], index: usize) {
+        for i in index..data.len() {
+            let [a, b] = &mut data[i.saturating_sub(1)..=i] else { continue };
+            b.invalidate_cache();
+            let b_beat = b.beat();
+            b.data_mut().cascade(b_beat, a.data(), a.beat());
+        }
+    }
+}
+
+impl<T: 'static + TimedData> Cascader for Timed<T> {
+    type Timeable = Self;
+    type MutRef<'c> = (f32, &'c mut T);
+    fn get_mut(data: &mut [Self], index: usize) -> Option<Self::MutRef<'_>> {
+        let t = data.get_mut(index)?;
+        Some((t.beat(), t.data_mut()))
+    }
+    fn cascade(data: &mut [Self], index: usize) {
+        let _ = (data, index);
+    }
+}
+
+impl<T: 'static + Event> Cascader for CacheableTimed<T> {
+    type Timeable = Self;
+    type MutRef<'c> = (f32, &'c mut T);
+    fn get_mut(data: &mut [Self], index: usize) -> Option<Self::MutRef<'_>> {
+        let t = data.get_mut(index)?;
+        Some((t.beat(), t.data_mut()))
+    }
+    fn cascade(data: &mut [Self], index: usize) {
+        let _ = (data, index);
+    }
+}
+
+impl<'c, T: Timeable<Data: CascadingUpdate>> CascadeMutGuard<'c, T> {
+    pub fn beat(&self) -> f32 {
+        self.track[self.index].beat()
+    }
+}
+
+impl<'c, T: Timeable<Data: CascadingUpdate>> std::ops::Deref for CascadeMutGuard<'c, T> {
+    type Target = T::Data;
+    fn deref(&self) -> &T::Data {
+        self.track[self.index].data()
+    }
+}
+
+impl<'c, T: Timeable<Data: CascadingUpdate>> std::ops::DerefMut for CascadeMutGuard<'c, T> {
+    fn deref_mut(&mut self) -> &mut T::Data {
+        self.dirty = true;
+        self.track[self.index].data_mut()
+    }
+}
+
+impl<'c, T: 'c + Timeable<Data: CascadingUpdate>> Drop for CascadeMutGuard<'c, T> {
+    fn drop(&mut self) {
+        if self.dirty {
+            Cascade::<T>::cascade(self.track, self.index)
+        }
+    }
+}
+
+impl<C: Cascader> Track<C> {
+    pub fn new(last_beat: f32) -> UninitializedTrack<C> {
         UninitializedTrack::new(last_beat)
     }
 
@@ -629,8 +718,27 @@ impl<T: Timeable> Track<T> {
         Self::from_vec(Vec::new(), last_beat)
     }
 
-    pub fn animate(&self, now: Now, rt: &RuntimeData) -> <T::Data as TimedData>::State {
-        <T::Data as TimedData>::Animator::animate(
+    pub fn from_unordered(data: Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>, last_beat: f32) -> Self {
+        let data = data
+            .into_iter()
+            .map(|u| <C::Timeable>::new(u.data, u.beat))
+            .collect();
+        Self::from_vec(data, last_beat)
+    }
+
+    fn from_vec(mut data: Vec<C::Timeable>, last_beat: f32) -> Self {
+        data.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
+        clip_vec(&mut data, last_beat);
+        C::cascade(&mut data, 0);
+        Self {
+            data,
+            default: <C::Timeable>::new(Default::default(), 0.),
+            last_beat,
+        }
+    }
+
+    pub fn animate(&self, now: Now, rt: &RuntimeData) -> <<C::Timeable as Timeable>::Data as TimedData>::State {
+        <<C::Timeable as Timeable>::Data as TimedData>::Animator::animate(
             &self.default,
             &self.data,
             self.last_beat,
@@ -639,27 +747,28 @@ impl<T: Timeable> Track<T> {
         )
     }
 
-    pub fn insert(&mut self, beat: f32, data: T::Data) -> Result<(), TrackInsertionError> {
-        track_insert(&mut self.data, self.last_beat, beat, data)?;
+    pub fn insert(&mut self, beat: f32, data: <C::Timeable as Timeable>::Data) -> Result<(), TrackInsertionError> {
+        let i = track_insert(&mut self.data, self.last_beat, beat, data)?;
+        C::cascade(&mut self.data, i);
         Ok(())
     }
 
-    pub fn data(&self) -> &[T] {
+    pub fn data(&self) -> &[C::Timeable] {
         &self.data
     }
 
-    pub fn get_mut(&mut self, index: usize) -> Option<(f32, &mut T::Data)> {
+    pub fn get_mut(&mut self, index: usize) -> Option<C::MutRef<'_>> {
         invalidate_neighbors(self.data.as_mut_slice(), index);
-        let d = self.data.get_mut(index)?;
-        Some((d.beat(), d.data_mut()))
+        C::get_mut(&mut self.data, index)
     }
 
-    pub fn remove(&mut self, index: usize) -> Option<(f32, T::Data)> {
+    pub fn remove(&mut self, index: usize) -> Option<(f32, <C::Timeable as Timeable>::Data)> {
         if index >= self.data.len() {
             None
         } else {
             invalidate_neighbors(self.data.as_mut_slice(), index);
             let t = self.data.remove(index);
+            C::cascade(&mut self.data, index);
             Some((t.beat(), t.take_data()))
         }
     }
@@ -670,145 +779,8 @@ impl<T: Timeable> Track<T> {
     }
 }
 
-impl<T: Timeable> PrivateTrackLike<T> for Track<T> {
-    fn from_vec(mut data: Vec<T>, last_beat: f32) -> Self {
-        data.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
-        clip_vec(&mut data, last_beat);
-        Self {
-            data,
-            default: T::new(Default::default(), 0.),
-            last_beat,
-        }
-    }
-}
-
-impl<T: Timeable> TrackLike<T> for Track<T> {}
-
-pub struct CascadeMutGuard<'c, T: Timeable<Data: CascadingUpdate>> {
-    track: &'c mut Vec<T>,
-    index: usize,
-    item: (f32, &'c mut T::Data),
-}
-
-impl<'c, T: Timeable<Data: CascadingUpdate>> std::ops::Deref for CascadeMutGuard<'c, T> {
-    type Target = (f32, &'c mut T::Data);
-    fn deref(&self) -> &Self::Target {
-        &self.item
-    }
-}
-
-impl<'c, T: Timeable<Data: CascadingUpdate>> std::ops::DerefMut for CascadeMutGuard<'c, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.item
-    }
-}
-
-impl<'c, T: Timeable<Data: CascadingUpdate>> Drop for CascadeMutGuard<'c, T> {
-    fn drop(&mut self) {
-        CascadeTrack::cascade_inner(self.track, self.index.saturating_sub(1))
-    }
-}
-
-impl<T: Timeable<Data: CascadingUpdate>> CascadeTrack<T> {
-    /// This is no different from calling Track::new or
-    /// UninitializedTrack::new
-    pub fn new(last_beat: f32) -> UninitializedTrack<T> {
-        UninitializedTrack::new(last_beat)
-    }
-
-    pub fn empty(last_beat: f32) -> Self {
-        Self::from_vec(Vec::new(), last_beat)
-    }
-
-    pub fn animate(&self, now: Now, rt: &RuntimeData) -> <T::Data as TimedData>::State {
-        <T::Data as TimedData>::Animator::animate(
-            &self.default,
-            &self.data,
-            self.last_beat,
-            now,
-            rt
-        )
-    }
-
-    pub(crate) fn cascade_inner(
-        data: &mut [T],
-        index: usize,
-    ) {
-        for i in index.saturating_add(1)..data.len() {
-            let [a, b] = &mut data[i-1..=i] else { continue };
-            b.invalidate_cache();
-            let b_beat = b.beat();
-            b.data_mut().cascade(b_beat, a.data(), a.beat());
-        }
-    }
-
-    pub(crate) fn cascade(&mut self, index: usize) {
-        Self::cascade_inner(&mut self.data, index)
-    }
-
-    pub fn insert(&mut self, beat: f32, data: T::Data) -> Result<(), TrackInsertionError> {
-        let i = track_insert(&mut self.data, self.last_beat, beat, data)?;
-        self.cascade(i.saturating_add(1));
-        Ok(())
-    }
-
-    pub fn data(&self) -> &[T] {
-        &self.data
-    }
-
-    pub fn get_mut(&mut self, index: usize) -> Option<CascadeMutGuard<'_, T>> {
-        // # Safety
-        // data.data_mut() keeps the &mut self lock alive after this
-        // function ends, and CascadeMutGuard can only touch one of the
-        // references at a time.
-        let self2 = unsafe { &mut *(self as *mut Self) };
-        if let Some(data) = self.data.get_mut(index) {
-            Some(CascadeMutGuard {
-                track: &mut self2.data,
-                index,
-                item: (data.beat(), data.data_mut())
-            })
-        } else {
-            None
-        }
-    }
-
-    pub fn remove(&mut self, index: usize) -> Option<(f32, T::Data)> {
-        if index >= self.data.len() {
-            None
-        } else {
-            let t = self.data.remove(index);
-            self.cascade(index.saturating_sub(1));
-            Some((t.beat(), t.take_data()))
-        }
-    }
-
-    /// Should be called after any changes are made to the RuntimeData or the Track
-    pub fn invalidate_caches(&mut self) {
-        self.data.iter_mut().for_each(Timeable::invalidate_cache)
-    }
-
-}
-
-impl<T: Timeable<Data: CascadingUpdate>> PrivateTrackLike<T> for CascadeTrack<T> {
-    fn from_vec(mut data: Vec<T>, last_beat: f32) -> Self {
-        data.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
-        clip_vec(&mut data, last_beat);
-        let mut s = Self {
-            data,
-            default: T::new(Default::default(), 0.),
-            last_beat,
-        };
-        s.cascade(0);
-        s
-    }
-}
-
-impl<T: Timeable<Data: CascadingUpdate>> TrackLike<T> for CascadeTrack<T> {}
-
-
-impl<T: Timeable> TrackSet<T> {
-    pub fn new(tracks: usize, last_beat: f32) -> UninitializedTrackSet<T> {
+impl<C: Cascader> TrackSet<C> {
+    pub fn new(tracks: usize, last_beat: f32) -> UninitializedTrackSet<C> {
         UninitializedTrackSet::new(tracks, last_beat)
     }
 
@@ -816,27 +788,34 @@ impl<T: Timeable> TrackSet<T> {
         let tracks = (0..tracks).map(|_| Vec::new()).collect();
         Self {
             tracks,
-            default: T::new(Default::default(), 0.),
+            default: <C::Timeable>::new(Default::default(), 0.),
             last_beat,
         }
     }
 
-    pub(crate) fn animate_inner(
-        tracks: &[impl AsRef<[T]>],
-        default: &T,
-        last_beat: f32,
-        track: usize,
-        now: Now,
-        rt: &RuntimeData,
-    ) -> Option<<T::Data as TimedData>::State> {
-        let track = tracks.get(track)?;
-        Some(<T::Data as TimedData>::Animator::animate(
-            default,
-            track.as_ref(),
+    pub fn from_unordered(data: Vec<Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>>, last_beat: f32) -> Self {
+        let data = data
+            .into_iter()
+            .map(|d| {
+                d.into_iter()
+                    .map(|u| <C::Timeable>::new(u.data, u.beat))
+                    .collect()
+            })
+            .collect();
+        Self::from_vecs(data, last_beat)
+    }
+
+    fn from_vecs(mut tracks: Vec<Vec<C::Timeable>>, last_beat: f32) -> Self {
+        for track in tracks.iter_mut() {
+            track.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
+            clip_vec(track, last_beat);
+            C::cascade(track, 0);
+        }
+        Self {
+            tracks,
+            default: <C::Timeable>::new(Default::default(), 0.),
             last_beat,
-            now,
-            rt,
-        ))
+        }
     }
 
     pub fn animate(
@@ -844,40 +823,15 @@ impl<T: Timeable> TrackSet<T> {
         track: usize,
         now: Now,
         rt: &RuntimeData,
-    ) -> Option<<T::Data as TimedData>::State> {
-        Self::animate_inner(
-            &self.tracks,
+    ) -> Option<<<C::Timeable as Timeable>::Data as TimedData>::State> {
+        let track = self.tracks.get(track)?;
+        Some(<<C::Timeable as Timeable>::Data as TimedData>::Animator::animate(
             &self.default,
-            self.last_beat,
             track,
+            self.last_beat,
             now,
-            rt
-        )
-    }
-
-    pub(crate) fn iter_animate_inner<R>(
-        tracks: &[impl AsRef<[T]>],
-        default: &T,
-        last_beat: f32,
-        now: Now,
-        rt: &RuntimeData,
-        track_count: usize,
-        frame: &mut Vec<R>,
-        transformer: impl Fn(<T::Data as TimedData>::State) -> R,
-    ) {
-        for i in 0..track_count {
-            let state = match tracks.get(i) {
-                Some(track) => <T::Data as TimedData>::Animator::animate(
-                    default,
-                    track.as_ref(),
-                    last_beat,
-                    now,
-                    rt,
-                ),
-                None => <T::Data as TimedData>::State::default(),
-            };
-            frame.push(transformer(state));
-        }
+            rt,
+        ))
     }
 
     /// Note: if the track set has fewer tracks than the frame expects, this creates a default
@@ -888,44 +842,22 @@ impl<T: Timeable> TrackSet<T> {
         rt: &RuntimeData,
         track_count: usize,
         frame: &mut Vec<R>,
-        transformer: impl Fn(<T::Data as TimedData>::State) -> R,
+        transformer: impl Fn(<<C::Timeable as Timeable>::Data as TimedData>::State) -> R,
     ) {
-        Self::iter_animate_inner(
-            &self.tracks,
-            &self.default,
-            self.last_beat,
-            now,
-            rt,
-            track_count,
-            frame,
-            transformer,
-        )
-    }
-
-    pub(crate) fn direct_animate_inner<R>(
-        tracks: &[impl AsRef<[T]>],
-        default: &T,
-        last_beat: f32,
-        now: Now,
-        rt: &RuntimeData,
-        frame: &mut [MaybeUninit<R>],
-        transformer: impl Fn(<T::Data as TimedData>::State) -> R,
-    ) -> usize {
-        for i in 0..frame.len() {
-            if i == tracks.len() {
-                return i;
-            }
-            let track = &tracks[i];
-            let state = <T::Data as TimedData>::Animator::animate(
-                default,
-                track.as_ref(),
-                last_beat,
-                now,
-                rt,
-            );
-            frame[i].write(transformer(state));
+        frame.reserve(track_count);
+        for i in 0..track_count {
+            let state = match self.tracks.get(i) {
+                Some(track) => <<C::Timeable as Timeable>::Data as TimedData>::Animator::animate(
+                    &self.default,
+                    track,
+                    self.last_beat,
+                    now,
+                    rt,
+                ),
+                None => <<C::Timeable as Timeable>::Data as TimedData>::State::default(),
+            };
+            frame.push(transformer(state));
         }
-        frame.len()
     }
 
     /// `frame` should hold uninitialized R elements.
@@ -938,17 +870,23 @@ impl<T: Timeable> TrackSet<T> {
         now: Now,
         rt: &RuntimeData,
         frame: &mut [MaybeUninit<R>],
-        transformer: impl Fn(<T::Data as TimedData>::State) -> R,
+        transformer: impl Fn(<<C::Timeable as Timeable>::Data as TimedData>::State) -> R,
     ) -> usize {
-        Self::direct_animate_inner(
-            &self.tracks,
-            &self.default,
-            self.last_beat,
-            now,
-            rt,
-            frame,
-            transformer,
-        )
+        for i in 0..frame.len() {
+            if i == self.tracks.len() {
+                return i;
+            }
+            let track = &self.tracks[i];
+            let state = <<C::Timeable as Timeable>::Data as TimedData>::Animator::animate(
+                &self.default,
+                track,
+                self.last_beat,
+                now,
+                rt,
+            );
+            frame[i].write(transformer(state));
+        }
+        frame.len()
     }
 
     pub fn track_count(&self) -> usize {
@@ -959,10 +897,11 @@ impl<T: Timeable> TrackSet<T> {
         &mut self,
         track: usize,
         beat: f32,
-        data: T::Data,
+        data: <C::Timeable as Timeable>::Data,
     ) -> Result<(), TrackSetInsertionError> {
         if let Some(track) = self.tracks.get_mut(track) {
-            track_insert(track, self.last_beat, beat, data)?;
+            let i = track_insert(track, self.last_beat, beat, data)?;
+            C::cascade(track, i);
             Ok(())
         } else {
             Err(TrackSetInsertionError::InvalidId {
@@ -972,24 +911,24 @@ impl<T: Timeable> TrackSet<T> {
         }
     }
 
-    pub fn data(&self, track: usize) -> Option<&[T]> {
+    pub fn data(&self, track: usize) -> Option<&[C::Timeable]> {
         Some(self.tracks.get(track)?)
     }
 
-    pub fn get_mut(&mut self, track: usize, index: usize) -> Option<(f32, &mut T::Data)> {
+    pub fn get_mut(&mut self, track: usize, index: usize) -> Option<C::MutRef<'_>> {
         let track = self.tracks.get_mut(track)?;
         invalidate_neighbors(track.as_mut_slice(), index);
-        let d = track.get_mut(index)?;
-        Some((d.beat(), d.data_mut()))
+        C::get_mut(track, index)
     }
 
-    pub fn remove(&mut self, track: usize, index: usize) -> Option<(f32, T::Data)> {
+    pub fn remove(&mut self, track: usize, index: usize) -> Option<(f32, <C::Timeable as Timeable>::Data)> {
         let track = self.tracks.get_mut(track)?;
         if index >= track.len() {
             None
         } else {
             invalidate_neighbors(track.as_mut_slice(), index);
             let t = track.remove(index);
+            C::cascade(track, index);
             Some((t.beat(), t.take_data()))
         }
     }
@@ -1002,174 +941,7 @@ impl<T: Timeable> TrackSet<T> {
     }
 }
 
-impl<T: Timeable> PrivateTrackSetLike<T> for TrackSet<T> {
-    fn from_vecs(mut tracks: Vec<Vec<T>>, last_beat: f32) -> Self {
-        for track in tracks.iter_mut() {
-            track.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
-            clip_vec(track, last_beat);
-        }
-        Self {
-            tracks,
-            default: T::new(Default::default(), 0.),
-            last_beat,
-        }
-    }
-}
-impl<T: Timeable> TrackSetLike<T> for TrackSet<T> {}
-
-impl<T: Timeable<Data: CascadingUpdate>> CascadeTrackSet<T> {
-    pub fn new(tracks: usize, last_beat: f32) -> UninitializedTrackSet<T> {
-        UninitializedTrackSet::new(tracks, last_beat)
-    }
-
-    pub fn empty(tracks: usize, last_beat: f32) -> Self {
-        let tracks = (0..tracks).map(|_| Vec::new()).collect();
-        Self {
-            tracks,
-            default: T::new(Default::default(), 0.),
-            last_beat,
-        }
-    }
-
-    pub fn animate(
-        &self,
-        track: usize,
-        now: Now,
-        rt: &RuntimeData,
-    ) -> Option<<T::Data as TimedData>::State> {
-        TrackSet::animate_inner(
-            &self.tracks,
-            &self.default,
-            self.last_beat,
-            track,
-            now,
-            rt
-        )
-    }
-
-    pub fn iter_animate<R>(
-        &self,
-        now: Now,
-        rt: &RuntimeData,
-        track_count: usize,
-        frame: &mut Vec<R>,
-        transformer: impl Fn(<T::Data as TimedData>::State) -> R,
-    ) {
-        TrackSet::iter_animate_inner(
-            &self.tracks,
-            &self.default,
-            self.last_beat,
-            now,
-            rt,
-            track_count,
-            frame,
-            transformer,
-        )
-    }
-
-    /// `frame` should hold uninitialized R elements.
-    /// in the case that the track set has fewer
-    /// tracks than the frame, it's the caller's responsibility to remove, or finish initializing
-    /// the elements that this function didn't touch.
-    /// this function therefore returns N as the number of values it wrote (0<=x<=frame.len())
-    pub fn direct_animate<R>(
-        &self,
-        now: Now,
-        rt: &RuntimeData,
-        frame: &mut [MaybeUninit<R>],
-        transformer: impl Fn(<T::Data as TimedData>::State) -> R,
-    ) -> usize {
-        TrackSet::direct_animate_inner(
-            &self.tracks,
-            &self.default,
-            self.last_beat,
-            now,
-            rt,
-            frame,
-            transformer,
-        )
-    }
-
-    pub fn track_count(&self) -> usize {
-        self.tracks.len()
-    }
-
-    pub fn insert(
-        &mut self,
-        track: usize,
-        beat: f32,
-        data: T::Data,
-    ) -> Result<(), TrackSetInsertionError> {
-        if let Some(track) = self.tracks.get_mut(track) {
-            let i = track_insert(track, self.last_beat, beat, data)?;
-            CascadeTrack::cascade_inner(track.as_mut(), i);
-            Ok(())
-        } else {
-            Err(TrackSetInsertionError::InvalidId {
-                max: self.tracks.len(),
-                id: track,
-            })
-        }
-    }
-
-    pub fn data(&self, track: usize) -> Option<&[T]> {
-        Some(self.tracks.get(track)?)
-    }
-    
-    pub fn get_mut(&mut self, track: usize, index: usize) -> Option<CascadeMutGuard<'_, T>> {
-        let track = self.tracks.get_mut(track)?;
-        // # Safety
-        // See CascadeTrack::get_mut for details
-        let track2 = unsafe { &mut *(track as *mut Vec<T>) };
-        if let Some(data) = track.get_mut(index) {
-            Some(CascadeMutGuard {
-                track: track2,
-                index,
-                item: (data.beat(), data.data_mut())
-            })
-        } else {
-            None
-        }
-    }
-    
-    pub fn remove(&mut self, track: usize, index: usize) -> Option<(f32, T::Data)> {
-        let track = self.tracks.get_mut(track)?;
-        if index >= track.len() {
-            None
-        } else {
-            let t = track.remove(index);
-            CascadeTrack::cascade_inner(track, index.saturating_sub(1));
-            Some((t.beat(), t.take_data()))
-        }
-    }
-    
-    pub fn invalidate_caches(&mut self) {
-        self.tracks.iter_mut().for_each(|t| {
-            t.iter_mut().for_each(Timeable::invalidate_cache)
-        });
-    }
-
-}
-
-impl<T: Timeable<Data: CascadingUpdate>> PrivateTrackSetLike<T> for CascadeTrackSet<T> {
-    fn from_vecs(mut tracks: Vec<Vec<T>>, last_beat: f32) -> Self {
-        for track in tracks.iter_mut() {
-            track.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
-            clip_vec(track, last_beat);
-            CascadeTrack::cascade_inner(track, 0);
-        }
-        Self {
-            tracks,
-            default: T::new(Default::default(), 0.),
-            last_beat,
-        }
-    }
-}
-
-impl<T: Timeable<Data: CascadingUpdate>> TrackSetLike<T> for CascadeTrackSet<T> {}
-
-
-impl<T: Timeable> UninitializedTrack<T> {
+impl<C: Cascader> UninitializedTrack<C> {
     pub fn new(last_beat: f32) -> Self {
         Self { data: Vec::new(), last_beat }
     }
@@ -1177,10 +949,10 @@ impl<T: Timeable> UninitializedTrack<T> {
     pub fn add(
         &mut self,
         beat: f32,
-        data: T::Data,
+        data: <C::Timeable as Timeable>::Data,
     ) -> Result<(), TrackInsertionError> {
         if (0f32..=self.last_beat).contains(&beat) {
-            self.data.push(T::new(data, beat));
+            self.data.push(<C::Timeable>::new(data, beat));
             Ok(())
         } else {
             Err(TrackInsertionError {
@@ -1190,15 +962,15 @@ impl<T: Timeable> UninitializedTrack<T> {
         }
     }
 
-    pub fn finalize<R: TrackLike<T>>(self) -> R {
-        R::from_vec(
+    pub fn finalize(self) -> Track<C> {
+        Track::from_vec(
             self.data,
             self.last_beat,
         )
     }
 }
 
-impl<T: Timeable> UninitializedTrackSet<T> {
+impl<C: Cascader> UninitializedTrackSet<C> {
     pub fn new(tracks: usize, last_beat: f32) -> Self {
         Self {
             tracks: (0..tracks).map(|_| Vec::new()).collect(),
@@ -1210,11 +982,11 @@ impl<T: Timeable> UninitializedTrackSet<T> {
         &mut self,
         track: usize,
         beat: f32,
-        data: T::Data,
+        data: <C::Timeable as Timeable>::Data,
     ) -> Result<(), TrackSetInsertionError> {
         if let Some(track) = self.tracks.get_mut(track) {
             if (0f32..=self.last_beat).contains(&beat) {
-                track.push(T::new(data, beat));
+                track.push(<C::Timeable>::new(data, beat));
                 Ok(())
             } else {
                 Err(TrackSetInsertionError::OutOfBounds(TrackInsertionError {
@@ -1230,8 +1002,8 @@ impl<T: Timeable> UninitializedTrackSet<T> {
         }
     }
 
-    pub fn finalize<R: TrackSetLike<T>>(self) -> R {
-        R::from_vecs(self.tracks, self.last_beat)
+    pub fn finalize(self) -> TrackSet<C> {
+        TrackSet::from_vecs(self.tracks, self.last_beat)
     }
 }
 
