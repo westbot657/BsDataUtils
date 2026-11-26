@@ -33,13 +33,13 @@ pub enum TrackSetInsertionError {
 
 // Helpers
 /// Handles base interpolation animation between points.
-pub(crate) fn animate_timed<P: Point, T: Timeable<Data = P>>(
+pub(crate) fn animate_timed<T: Timeable<Data: Point>>(
     default: &T,
     data: &[T],
     last_beat: f32,
     now: Now,
     rt: &RuntimeData,
-) -> P::State {
+) -> <T::Data as TimedData>::State {
     let i = data.partition_point(|p| p.beat() <= now.beat);
 
     let a = match i.checked_sub(1) {
@@ -56,8 +56,9 @@ pub(crate) fn animate_timed<P: Point, T: Timeable<Data = P>>(
         }
     };
 
-    a.data()
-        .interpolate(b.data(), TimeSpan::new(now, a.beat(), b.beat()), rt)
+    let span = TimeSpan::new(now, a.beat(), b.beat());
+
+    a.data().interpolate(b.data(), span, rt)
 }
 
 /// invalidates `i`+1. `i` is left alone since it's assumed to get invalidated by
@@ -108,8 +109,8 @@ fn track_insert<T: Timeable>(
 
 // Traits
 /// Represents an Animator over data.
-pub trait Animator<D: TimedData, T: Timeable<Data = D>> {
-    fn animate(default: &T, track: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> D::State;
+pub trait Animator<T: Timeable> {
+    fn animate(default: &T, track: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> <T::Data as TimedData>::State;
 }
 
 /// Represents a type that sits at a point in time.
@@ -118,7 +119,7 @@ pub trait TimedData: Clone + Default {
     /// Which animator is needed to handle this data;
     /// EventAnimator is for Events.
     /// PointAnimator is for Points.
-    type Animator<T: Timeable<Data = Self>>: Animator<Self, T>;
+    type Animator<T: Timeable<Data = Self>>: Animator<T>;
 
     /// The output state of the data interpolation.
     /// i.e. F32Point's State is f32, and an Event that produces F32Points also has an f32 State.
@@ -420,14 +421,14 @@ impl<'d, P: Point> Point for Cow<'d, P> {
     }
 }
 
-impl<P: Point, T: Timeable<Data = P>> Animator<P, T> for PointAnimator<P> {
-    fn animate(default: &T, data: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> P::State {
+impl<T: Timeable<Data: Point>> Animator<T> for PointAnimator<T::Data> {
+    fn animate(default: &T, data: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> <T::Data as TimedData>::State {
         animate_timed(default, data, last_beat, now, rt)
     }
 }
 
-impl<E: Event, T: Timeable<Data = E>> Animator<E, T> for EventAnimator<E> {
-    fn animate(default: &T, data: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> E::State {
+impl<T: Timeable<Data: Event>> Animator<T> for EventAnimator<T::Data> {
+    fn animate(default: &T, data: &[T], last_beat: f32, now: Now, rt: &RuntimeData) -> <T::Data as TimedData>::State {
         let i = data.partition_point(|e| e.beat() <= now.beat);
 
         let a = match i.checked_sub(2) {
@@ -437,7 +438,7 @@ impl<E: Event, T: Timeable<Data = E>> Animator<E, T> for EventAnimator<E> {
         let b = i.checked_sub(1).map(|j| &data[j]);
         let c = data.get(i);
 
-        let default_point: <E as Event>::Point = Default::default();
+        let default_point: <T::Data as Event>::Point = Default::default();
         match (b, c) {
             // Empty event list
             (None, None) => {
@@ -463,28 +464,28 @@ impl<E: Event, T: Timeable<Data = E>> Animator<E, T> for EventAnimator<E> {
                 debug_assert!(
                     !b_points.is_empty(),
                     "get_points returned an empty point list ({})",
-                    std::any::type_name::<E>()
+                    std::any::type_name::<T::Data>()
                 );
                 debug_assert!(
                     b_points.windows(2).all(|w| w[0].0 <= w[1].0),
                     "get_points returned an unordered point list ({})",
-                    std::any::type_name::<E>()
+                    std::any::type_name::<T::Data>()
                 );
 
                 let c_points = c.get_points(b, rt);
                 debug_assert!(
                     !c_points.is_empty(),
                     "get_points returned an empty point list ({})",
-                    std::any::type_name::<E>()
+                    std::any::type_name::<T::Data>()
                 );
                 debug_assert!(
                     c_points.windows(2).all(|w| w[0].0 <= w[1].0),
                     "get_points returned an unordered point list ({})",
-                    std::any::type_name::<E>()
+                    std::any::type_name::<T::Data>()
                 );
 
                 let cutoff = c_points.first().map_or(f32::INFINITY, |(beat, _)| *beat);
-                let b_points = E::clip(b_points, cutoff, rt);
+                let b_points = T::Data::clip(b_points, cutoff, rt);
 
                 let points: TinyVec<_, 8> = b_points
                     .into_iter()
