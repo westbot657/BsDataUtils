@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::ops::{Bound, Range, RangeBounds};
 use tiny_vec::TinyVec;
 
 // Errors
@@ -28,6 +29,16 @@ pub enum TrackSetInsertionError {
     OutOfBounds(#[from] TrackInsertionError),
     #[error("invalid object id: {id} expected 0..{max}")]
     InvalidId { max: usize, id: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum ShiftError {
+    #[error("f32 is not finite")]
+    NotFinite,
+    /// The shift would push elements outside the allowed bounds.
+    /// `min..=max` is the range of deltas that would have been accepted.
+    #[error("shift is out of bounds {min}..={max}")]
+    OutOfBounds { min: f32, max: f32 },
 }
 
 
@@ -104,6 +115,21 @@ fn track_insert<T: Timeable>(
             got: beat,
         })
     }
+}
+
+/// Resolves any RangeBounds into a concrete `start..end` within `len`.
+fn resolve_range(r: impl RangeBounds<usize>, len: usize) -> Option<Range<usize>> {
+    let start = match r.start_bound() {
+        Bound::Included(&s) => s,
+        Bound::Excluded(&s) => s.checked_add(1)?,
+        Bound::Unbounded => 0,
+    };
+    let end = match r.end_bound() {
+        Bound::Included(&e) => e.checked_add(1)?,
+        Bound::Excluded(&e) => e,
+        Bound::Unbounded => len,
+    };
+    (start <= end && end <= len).then_some(start..end)
 }
 
 
@@ -188,6 +214,7 @@ pub(crate) trait PrivateTimeable<D: TimedData> {
     fn new(data: D, beat: f32) -> Self;
     /// take_data is private.
     fn take_data(self) -> D;
+    fn beat_mut(&mut self) -> &mut f32;
 }
 
 /// Represents both Timed<D> and CacheableTimed<D>
@@ -212,8 +239,11 @@ pub trait Timeable: PrivateTimeable<Self::Data> {
     fn invalidate_cache(&mut self) {}
 }
 
+/// Represents a type where changing one element's data requires the next element to
+/// recompute its own internal state.
 pub trait CascadingUpdate: TimedData {
-    fn cascade(&mut self, beat: f32, previous: &Self, previous_beat: f32);
+    type CascadeReferenceData: ?Sized;
+    fn cascade(&mut self, beat: f32, previous: &Self, previous_beat: f32, data: &Self::CascadeReferenceData);
 }
 
 /// Indicates the cascading behavior of a Track/TrackSet.
@@ -225,8 +255,9 @@ pub trait Cascader {
     type MutRef<'c>
     where
         Self::Timeable: 'c;
-    fn get_mut(data: &mut [Self::Timeable], index: usize) -> Option<Self::MutRef<'_>>;
-    fn cascade(data: &mut [Self::Timeable], index: usize);
+    type CascadeReferenceData: ?Sized;
+    fn get_mut<'c>(list: &'c mut [Self::Timeable], index: usize, data: &'c Self::CascadeReferenceData) -> Option<Self::MutRef<'c>>;
+    fn cascade(list: &mut [Self::Timeable], index: usize, data: &Self::CascadeReferenceData);
 }
 
 
@@ -289,6 +320,28 @@ pub struct CacheableTimed<E: Event> {
 /// is modified.
 pub struct Cascade<T: Timeable>(PhantomData<fn() -> T>);
 
+pub struct CascadeMutGuard<'c, T: 'c + Timeable<Data: CascadingUpdate>> {
+    track: &'c mut [T],
+    index: usize,
+    dirty: bool,
+    data: &'c <T::Data as CascadingUpdate>::CascadeReferenceData,
+}
+
+/// A mutable view over part of a track that keeps beat ordering intact.
+/// Only the root view (created by `slice_mut`) cascades, on drop and from index 0.
+/// Sub-slices made with `slice` don't cascade, since the root outlives them.
+pub struct TimedSliceMut<'d, C: Cascader> {
+    /// The entire list. The active elements are `full[range]`.
+    full: &'d mut [C::Timeable],
+    /// Absolute indices into `full`.
+    range: Range<usize>,
+    /// Whether this view cascades when dropped.
+    root: bool,
+    /// Minimum and maximum beat that elements of the active range may have.
+    bounds: (f32, f32),
+    cascade_data: &'d C::CascadeReferenceData,
+}
+
 /// Holds a single animation track.
 ///
 /// Points are looked up by a binary search which is the fastest and simplest
@@ -332,12 +385,6 @@ pub struct TrackSet<C: Cascader> {
     // only needed internally, the user should already
     // have this value anyways since it comes from them
     last_beat: f32,
-}
-
-pub struct CascadeMutGuard<'c, T: 'c + Timeable<Data: CascadingUpdate>> {
-    track: &'c mut [T],
-    index: usize,
-    dirty: bool,
 }
 
 /// Track builder for adding data elements quickly,
@@ -509,6 +556,10 @@ impl<D: TimedData> PrivateTimeable<D> for Timed<D> {
     fn take_data(self) -> D {
         self.data
     }
+    #[inline]
+    fn beat_mut(&mut self) -> &mut f32 {
+        &mut self.beat
+    }
 }
 
 impl<D: TimedData> Timeable for Timed<D> {
@@ -538,6 +589,20 @@ impl<D: TimedData> Timeable for Timed<D> {
     }
 }
 
+impl<T: 'static + TimedData> Cascader for Timed<T> {
+    type Timeable = Self;
+    type MutRef<'c> = (f32, &'c mut T);
+    type CascadeReferenceData = ();
+    fn get_mut<'c>(list: &'c mut [Self], index: usize, data: &()) -> Option<Self::MutRef<'c>> {
+        let _ = data;
+        let t = list.get_mut(index)?;
+        Some((t.beat(), t.data_mut()))
+    }
+    fn cascade(list: &mut [Self], index: usize, data: &()) {
+        let _ = (list, index, data);
+    }
+}
+
 impl<E: Event> PrivateTimeable<E> for CacheableTimed<E> {
     #[inline]
     fn new(data: E, beat: f32) -> Self {
@@ -550,6 +615,11 @@ impl<E: Event> PrivateTimeable<E> for CacheableTimed<E> {
     #[inline]
     fn take_data(self) -> E {
         self.data
+    }
+    #[inline]
+    fn beat_mut(&mut self) -> &mut f32 {
+        self.invalidate_cache();
+        &mut self.beat
     }
 }
 
@@ -596,18 +666,36 @@ impl<E: Event> Timeable for CacheableTimed<E> {
     }
 }
 
+impl<T: 'static + Event> Cascader for CacheableTimed<T> {
+    type Timeable = Self;
+    type MutRef<'c> = (f32, &'c mut T);
+    type CascadeReferenceData = ();
+    fn get_mut<'c>(list: &'c mut [Self], index: usize, data: &()) -> Option<Self::MutRef<'c>> {
+        let _ = data;
+        let t = list.get_mut(index)?;
+        Some((t.beat(), t.data_mut()))
+    }
+    fn cascade(list: &mut [Self], index: usize, data: &()) {
+        let _ = (list, index, data);
+    }
+}
+
 impl<T: Timeable<Data: CascadingUpdate>> Cascader for Cascade<T> {
     type Timeable = T;
     type MutRef<'c>
         = CascadeMutGuard<'c, T>
     where
         T: 'c;
-    fn get_mut(data: &mut [T], index: usize) -> Option<Self::MutRef<'_>> {
-        if index < data.len() {
+    type CascadeReferenceData = <<Self::Timeable as Timeable>::Data as CascadingUpdate>::CascadeReferenceData
+    where
+        <Self::Timeable as Timeable>::Data: CascadingUpdate;
+    fn get_mut<'c>(list: &'c mut [T], index: usize, data: &'c Self::CascadeReferenceData) -> Option<Self::MutRef<'c>> {
+        if index < list.len() {
             Some(CascadeMutGuard {
-                track: data,
+                track: list,
                 index,
                 dirty: false,
+                data,
             })
         } else {
             None
@@ -615,39 +703,15 @@ impl<T: Timeable<Data: CascadingUpdate>> Cascader for Cascade<T> {
     }
     /// Recomputes every element from `data[index..]` against the
     /// previous element.
-    fn cascade(data: &mut [T], index: usize) {
-        for i in index..data.len() {
-            let [a, b] = &mut data[i.saturating_sub(1)..=i] else {
+    fn cascade(list: &mut [T], index: usize, data: &Self::CascadeReferenceData) {
+        for i in index..list.len() {
+            let [a, b] = &mut list[i.saturating_sub(1)..=i] else {
                 continue;
             };
             b.invalidate_cache();
             let b_beat = b.beat();
-            b.data_mut().cascade(b_beat, a.data(), a.beat());
+            b.data_mut().cascade(b_beat, a.data(), a.beat(), data);
         }
-    }
-}
-
-impl<T: 'static + TimedData> Cascader for Timed<T> {
-    type Timeable = Self;
-    type MutRef<'c> = (f32, &'c mut T);
-    fn get_mut(data: &mut [Self], index: usize) -> Option<Self::MutRef<'_>> {
-        let t = data.get_mut(index)?;
-        Some((t.beat(), t.data_mut()))
-    }
-    fn cascade(data: &mut [Self], index: usize) {
-        let _ = (data, index);
-    }
-}
-
-impl<T: 'static + Event> Cascader for CacheableTimed<T> {
-    type Timeable = Self;
-    type MutRef<'c> = (f32, &'c mut T);
-    fn get_mut(data: &mut [Self], index: usize) -> Option<Self::MutRef<'_>> {
-        let t = data.get_mut(index)?;
-        Some((t.beat(), t.data_mut()))
-    }
-    fn cascade(data: &mut [Self], index: usize) {
-        let _ = (data, index);
     }
 }
 
@@ -674,7 +738,129 @@ impl<'c, T: Timeable<Data: CascadingUpdate>> std::ops::DerefMut for CascadeMutGu
 impl<'c, T: 'c + Timeable<Data: CascadingUpdate>> Drop for CascadeMutGuard<'c, T> {
     fn drop(&mut self) {
         if self.dirty {
-            Cascade::<T>::cascade(self.track, self.index)
+            Cascade::<T>::cascade(self.track, self.index, self.data)
+        }
+    }
+}
+
+impl<'d, C: Cascader> TimedSliceMut<'d, C> {
+    /// `outer` is used for the side(s) of the range that touch the ends of `full`.
+    fn from_parts(
+        full: &'d mut [C::Timeable],
+        range: Range<usize>,
+        outer: (f32, f32),
+        root: bool,
+        cascade_data: &'d C::CascadeReferenceData,
+    ) -> Self {
+        let min = range.start.checked_sub(1).map_or(outer.0, |i| full[i].beat());
+        let max = full.get(range.end).map_or(outer.1, |t| t.beat());
+        Self { full, range, root, bounds: (min, max), cascade_data }
+    }
+
+    pub(crate) fn new_root(
+        full: &'d mut [C::Timeable],
+        range: Range<usize>,
+        last_beat: f32,
+        cascade_data: &'d C::CascadeReferenceData,
+    ) -> Self {
+        Self::from_parts(full, range, (0.0, last_beat), true, cascade_data)
+    }
+
+    /// Sub-slice relative to this view. Edges of the sub-slice may move up to
+    /// the beats of the elements just outside it.
+    pub fn slice(&mut self, r: impl RangeBounds<usize>) -> Option<TimedSliceMut<'_, C>> {
+        let rel = resolve_range(r, self.range.len())?;
+        let abs = self.range.start + rel.start..self.range.start + rel.end;
+        Some(TimedSliceMut::from_parts(
+            &mut *self.full,
+            abs,
+            self.bounds,
+            false,
+            self.cascade_data,
+        ))
+    }
+
+    pub fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+
+    /// Read-only view of the active elements.
+    pub fn data(&self) -> &[C::Timeable] {
+        &self.full[self.range.clone()]
+    }
+
+    pub fn lower_bound(&self) -> f32 {
+        self.bounds.0
+    }
+
+    pub fn upper_bound(&self) -> f32 {
+        self.bounds.1
+    }
+
+    fn allowed_shift(&self) -> (f32, f32) {
+        let d = self.data();
+        let first = d[0].beat();
+        let last = d[d.len() - 1].beat();
+        (self.bounds.0 - first, self.bounds.1 - last)
+    }
+
+    fn apply_shift(&mut self, delta: f32) {
+        let (lo, hi) = self.bounds;
+        let range = self.range.clone();
+        for t in &mut self.full[range.clone()] {
+            let b = t.beat_mut();
+            // Clamping guards against float drift pushing an edge out of bounds.
+            // It is monotonic, so ordering is preserved.
+            *b = (*b + delta).max(lo).min(hi);
+            // Shifting changes this element's own cached points.
+            t.invalidate_cache();
+        }
+        // The element after the range now has a different `previous`.
+        if let Some(next) = self.full.get_mut(range.end) {
+            next.invalidate_cache();
+        }
+    }
+
+    /// Shifts every element by `delta`, keeping the spacing between them.
+    /// If the shift were to leave the bounds, it is clamped to the largest allowed value.
+    /// Errors only if `delta` is not finite.
+    pub fn shift(&mut self, delta: f32) -> Result<(), ShiftError> {
+        if !delta.is_finite() {
+            return Err(ShiftError::NotFinite);
+        }
+        if self.is_empty() {
+            return Ok(());
+        }
+        let (min, max) = self.allowed_shift();
+        self.apply_shift(delta.max(min).min(max));
+        Ok(())
+    }
+
+    /// Like `shift`, but errors instead of clamping.
+    pub fn try_shift(&mut self, delta: f32) -> Result<(), ShiftError> {
+        if !delta.is_finite() {
+            return Err(ShiftError::NotFinite);
+        }
+        if self.is_empty() {
+            return Ok(());
+        }
+        let (min, max) = self.allowed_shift();
+        if delta < min || delta > max {
+            return Err(ShiftError::OutOfBounds { min, max });
+        }
+        self.apply_shift(delta);
+        Ok(())
+    }
+}
+
+impl<'d, C: Cascader> Drop for TimedSliceMut<'d, C> {
+    fn drop(&mut self) {
+        if self.root {
+            C::cascade(self.full, self.range.start, self.cascade_data);
         }
     }
 }
@@ -685,26 +871,31 @@ impl<C: Cascader> Track<C> {
     }
 
     pub fn empty(last_beat: f32) -> Self {
-        Self::from_vec(Vec::new(), last_beat)
+        Self {
+            data: Vec::new(),
+            default: <C::Timeable>::new(Default::default(), 0.),
+            last_beat,
+        }
     }
 
-    pub fn from_unordered(
-        data: Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>,
+    fn from_unordered_raw(
+        list: Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>,
         last_beat: f32,
+        data: &C::CascadeReferenceData,
     ) -> Self {
-        let data = data
+        let list = list
             .into_iter()
             .map(|u| <C::Timeable>::new(u.data, u.beat))
             .collect();
-        Self::from_vec(data, last_beat)
+        Self::from_vec(list, last_beat, data)
     }
 
-    fn from_vec(mut data: Vec<C::Timeable>, last_beat: f32) -> Self {
-        data.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
-        clip_vec(&mut data, last_beat);
-        C::cascade(&mut data, 0);
+    fn from_vec(mut list: Vec<C::Timeable>, last_beat: f32, data: &C::CascadeReferenceData) -> Self {
+        list.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
+        clip_vec(&mut list, last_beat);
+        C::cascade(&mut list, 0, data);
         Self {
-            data,
+            data: list,
             default: <C::Timeable>::new(Default::default(), 0.),
             last_beat,
         }
@@ -724,13 +915,14 @@ impl<C: Cascader> Track<C> {
         )
     }
 
-    pub fn insert(
+    fn insert_raw(
         &mut self,
         beat: f32,
         data: <C::Timeable as Timeable>::Data,
+        cascade_data: &C::CascadeReferenceData,
     ) -> Result<(), TrackInsertionError> {
         let i = track_insert(&mut self.data, self.last_beat, beat, data)?;
-        C::cascade(&mut self.data, i);
+        C::cascade(&mut self.data, i, cascade_data);
         Ok(())
     }
 
@@ -738,18 +930,32 @@ impl<C: Cascader> Track<C> {
         &self.data
     }
 
-    pub fn get_mut(&mut self, index: usize) -> Option<C::MutRef<'_>> {
+    fn get_mut_raw<'c>(&'c mut self, index: usize, cascade_data: &'c C::CascadeReferenceData) -> Option<C::MutRef<'c>> {
         invalidate_neighbors(self.data.as_mut_slice(), index);
-        C::get_mut(&mut self.data, index)
+        C::get_mut(&mut self.data, index, cascade_data)
     }
 
-    pub fn remove(&mut self, index: usize) -> Option<(f32, <C::Timeable as Timeable>::Data)> {
+    fn slice_mut_raw<'c>(
+        &'c mut self,
+        index: impl RangeBounds<usize>,
+        cascade_data: &'c C::CascadeReferenceData,
+    ) -> Option<TimedSliceMut<'c, C>> {
+        let range = resolve_range(index, self.data.len())?;
+        Some(TimedSliceMut::new_root(
+            &mut self.data,
+            range,
+            self.last_beat,
+            cascade_data,
+        ))
+    }
+
+    fn remove_raw(&mut self, index: usize, cascade_data: &C::CascadeReferenceData) -> Option<(f32, <C::Timeable as Timeable>::Data)> {
         if index >= self.data.len() {
             None
         } else {
             invalidate_neighbors(self.data.as_mut_slice(), index);
             let t = self.data.remove(index);
-            C::cascade(&mut self.data, index);
+            C::cascade(&mut self.data, index, cascade_data);
             Some((t.beat(), t.take_data()))
         }
     }
@@ -774,11 +980,12 @@ impl<C: Cascader> TrackSet<C> {
         }
     }
 
-    pub fn from_unordered(
-        data: Vec<Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>>,
+    fn from_unordered_raw(
+        list: Vec<Vec<UnorderedTimed<<C::Timeable as Timeable>::Data>>>,
         last_beat: f32,
+        data: &C::CascadeReferenceData,
     ) -> Self {
-        let data = data
+        let list = list
             .into_iter()
             .map(|d| {
                 d.into_iter()
@@ -786,14 +993,14 @@ impl<C: Cascader> TrackSet<C> {
                     .collect()
             })
             .collect();
-        Self::from_vecs(data, last_beat)
+        Self::from_vecs(list, last_beat, data)
     }
 
-    fn from_vecs(mut tracks: Vec<Vec<C::Timeable>>, last_beat: f32) -> Self {
+    fn from_vecs(mut tracks: Vec<Vec<C::Timeable>>, last_beat: f32, data: &C::CascadeReferenceData) -> Self {
         for track in tracks.iter_mut() {
             track.sort_by(|a, b| a.beat().total_cmp(&b.beat()));
             clip_vec(track, last_beat);
-            C::cascade(track, 0);
+            C::cascade(track, 0, data);
         }
         Self {
             tracks,
@@ -879,15 +1086,16 @@ impl<C: Cascader> TrackSet<C> {
         self.tracks.len()
     }
 
-    pub fn insert(
+    fn insert_raw(
         &mut self,
         track: usize,
         beat: f32,
         data: <C::Timeable as Timeable>::Data,
+        cascade_data: &C::CascadeReferenceData,
     ) -> Result<(), TrackSetInsertionError> {
         if let Some(track) = self.tracks.get_mut(track) {
             let i = track_insert(track, self.last_beat, beat, data)?;
-            C::cascade(track, i);
+            C::cascade(track, i, cascade_data);
             Ok(())
         } else {
             Err(TrackSetInsertionError::InvalidId {
@@ -901,16 +1109,33 @@ impl<C: Cascader> TrackSet<C> {
         Some(self.tracks.get(track)?)
     }
 
-    pub fn get_mut(&mut self, track: usize, index: usize) -> Option<C::MutRef<'_>> {
+    fn get_mut_raw<'c>(&'c mut self, track: usize, index: usize, data: &'c C::CascadeReferenceData) -> Option<C::MutRef<'c>> {
         let track = self.tracks.get_mut(track)?;
         invalidate_neighbors(track.as_mut_slice(), index);
-        C::get_mut(track, index)
+        C::get_mut(track, index, data)
     }
 
-    pub fn remove(
+    fn slice_mut_raw<'c>(
+        &'c mut self,
+        track: usize,
+        index: impl RangeBounds<usize>,
+        cascade_data: &'c C::CascadeReferenceData,
+    ) -> Option<TimedSliceMut<'c, C>> {
+        let track = self.tracks.get_mut(track)?;
+        let range = resolve_range(index, track.len())?;
+        Some(TimedSliceMut::new_root(
+            track.as_mut_slice(),
+            range,
+            self.last_beat,
+            cascade_data,
+        ))
+    }
+
+    fn remove_raw(
         &mut self,
         track: usize,
         index: usize,
+        data: &C::CascadeReferenceData,
     ) -> Option<(f32, <C::Timeable as Timeable>::Data)> {
         let track = self.tracks.get_mut(track)?;
         if index >= track.len() {
@@ -918,7 +1143,7 @@ impl<C: Cascader> TrackSet<C> {
         } else {
             invalidate_neighbors(track.as_mut_slice(), index);
             let t = track.remove(index);
-            C::cascade(track, index);
+            C::cascade(track, index, data);
             Some((t.beat(), t.take_data()))
         }
     }
@@ -955,8 +1180,8 @@ impl<C: Cascader> UninitializedTrack<C> {
         }
     }
 
-    pub fn finalize(self) -> Track<C> {
-        Track::from_vec(self.data, self.last_beat)
+    fn finalize_raw(self, data: &C::CascadeReferenceData) -> Track<C> {
+        Track::from_vec(self.data, self.last_beat, data)
     }
 }
 
@@ -992,9 +1217,147 @@ impl<C: Cascader> UninitializedTrackSet<C> {
         }
     }
 
-    pub fn finalize(self) -> TrackSet<C> {
-        TrackSet::from_vecs(self.tracks, self.last_beat)
+    fn finalize_raw(self, data: &C::CascadeReferenceData) -> TrackSet<C> {
+        TrackSet::from_vecs(self.tracks, self.last_beat, data)
     }
+}
+
+
+// Specialized impls
+macro_rules! specialized_track {
+    (
+        generics: [$($gen:tt)*],
+        cascader: $C:ty,
+        data: $Data:ty,
+        extra: [$($name:ident: $ty:ty)?],
+        pass: $pass:expr $(,)?
+    ) => {
+        impl<$($gen)*> Track<$C> {
+            pub fn from_unordered(
+                list: Vec<UnorderedTimed<$Data>>,
+                last_beat: f32,
+                $($name: &$ty,)?
+            ) -> Self {
+                Self::from_unordered_raw(list, last_beat, $pass)
+            }
+
+            pub fn insert(
+                &mut self,
+                beat: f32,
+                data: $Data,
+                $($name: &$ty,)?
+            ) -> Result<(), TrackInsertionError> {
+                self.insert_raw(beat, data, $pass)
+            }
+
+            pub fn get_mut<'c>(
+                &'c mut self,
+                index: usize,
+                $($name: &'c $ty,)?
+            ) -> Option<<$C as Cascader>::MutRef<'c>> {
+                self.get_mut_raw(index, $pass)
+            }
+
+            pub fn slice_mut<'c>(
+                &'c mut self,
+                index: impl RangeBounds<usize>,
+                $($name: &'c $ty,)?
+            ) -> Option<TimedSliceMut<'c, $C>> {
+                self.slice_mut_raw(index, $pass)
+            }
+
+            pub fn remove(
+                &mut self,
+                index: usize,
+                $($name: &$ty,)?
+            ) -> Option<(f32, $Data)> {
+                self.remove_raw(index, $pass)
+            }
+        }
+
+        impl<$($gen)*> TrackSet<$C> {
+            pub fn from_unordered(
+                list: Vec<Vec<UnorderedTimed<$Data>>>,
+                last_beat: f32,
+                $($name: &$ty,)?
+            ) -> Self {
+                Self::from_unordered_raw(list, last_beat, $pass)
+            }
+
+            pub fn insert(
+                &mut self,
+                track: usize,
+                beat: f32,
+                data: $Data,
+                $($name: &$ty,)?
+            ) -> Result<(), TrackSetInsertionError> {
+                self.insert_raw(track, beat, data, $pass)
+            }
+
+            pub fn get_mut<'c>(
+                &'c mut self,
+                track: usize,
+                index: usize,
+                $($name: &'c $ty,)?
+            ) -> Option<<$C as Cascader>::MutRef<'c>> {
+                self.get_mut_raw(track, index, $pass)
+            }
+
+            pub fn slice_mut<'c>(
+                &'c mut self,
+                track: usize,
+                index: impl RangeBounds<usize>,
+                $($name: &'c $ty,)?
+            ) -> Option<TimedSliceMut<'c, $C>> {
+                self.slice_mut_raw(track, index, $pass)
+            }
+
+            pub fn remove(
+                &mut self,
+                track: usize,
+                index: usize,
+                $($name: &$ty,)?
+            ) -> Option<(f32, $Data)> {
+                self.remove_raw(track, index, $pass)
+            }
+        }
+
+        impl<$($gen)*> UninitializedTrack<$C> {
+            pub fn finalize(self $(, $name: &$ty)?) -> Track<$C> {
+                self.finalize_raw($pass)
+            }
+        }
+
+        impl<$($gen)*> UninitializedTrackSet<$C> {
+            pub fn finalize(self $(, $name: &$ty)?) -> TrackSet<$C> {
+                self.finalize_raw($pass)
+            }
+        }
+    };
+}
+
+specialized_track! {
+    generics: [T: Timeable<Data: CascadingUpdate>],
+    cascader: Cascade<T>,
+    data: T::Data,
+    extra: [cascade_data: <T::Data as CascadingUpdate>::CascadeReferenceData],
+    pass: cascade_data,
+}
+
+specialized_track! {
+    generics: [D: 'static + TimedData],
+    cascader: Timed<D>,
+    data: D,
+    extra: [],
+    pass: &(),
+}
+
+specialized_track! {
+    generics: [D: 'static + Event],
+    cascader: CacheableTimed<D>,
+    data: D,
+    extra: [],
+    pass: &(),
 }
 
 

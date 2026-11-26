@@ -265,7 +265,8 @@ pub struct RingRotationEvent {
 timed!(event RingRotationEvent: RingRotationPointValue);
 
 impl CascadingUpdate for RingRotationEvent {
-    fn cascade(&mut self, beat: f32, previous: &Self, previous_beat: f32) {
+    type CascadeReferenceData = [f32];
+    fn cascade(&mut self, beat: f32, previous: &Self, previous_beat: f32, data: &[f32]) {
         todo!()
     }
 }
