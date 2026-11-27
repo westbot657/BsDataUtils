@@ -55,21 +55,6 @@ pub const CHAIN_LINK_HITBOX: HitBox = HitBox::new(
     Vec3::new(0.25, 0.25 * 2. / 16., 0.25),
 );
 
-#[inline]
-pub(crate) fn cfg_mirror_pos(v: Vec3) -> Vec3 {
-    if cfg!(feature = "beatcraft_worldspace") { Vec3::new(-v.x, v.y, v.z) } else { v }
-}
-
-#[inline]
-pub(crate) fn cfg_mirror_quat(q: Quat) -> Quat {
-    if cfg!(feature = "beatcraft_worldspace") { Quat::from_xyzw(-q.x, q.y, q.z, -q.w) } else { q }
-}
-
-#[inline]
-pub(crate) fn inv_cfg_mirror_quat(q: Quat) -> Quat {
-    if cfg!(feature = "beatcraft_worldspace") { q } else { Quat::from_xyzw(-q.x, q.y, q.z, -q.w) }
-}
-
 pub trait GameObject<ObjectSource> {
     fn beat(&self) -> f32;
     fn grid_pos(&self) -> Vec2;
@@ -104,16 +89,15 @@ pub trait GameObject<ObjectSource> {
     fn custom_njs_offset(&self) -> Option<f32> {
         None
     }
-    fn affected_by_scale(&self) -> bool { true }
-
+    fn affected_by_scale(&self) -> bool {
+        true
+    }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         None
     }
-
     fn upcast_chain_head(&self) -> Option<&ChainNote<ObjectSource>> {
         None
     }
-
     fn editor_hitbox(&self, _beat_spacing: Option<f32>) -> HitBox {
         NOTE_HITBOX
     }
@@ -152,9 +136,15 @@ pub trait GameObject<ObjectSource> {
 
             let gp = Vec2::new(-1.5 + gp.x, gp.y + 0.5) * 0.6;
 
-            m *= Mat4::from_quat(inv_cfg_mirror_quat(self.lane_rotation()));
-            m *= Mat4::from_translation(cfg_mirror_pos(gp.extend((b - beat) * beat_spacing)));
-            m *= Mat4::from_quat(cfg_mirror_quat(self.get_orientation()));
+            m *= Mat4::from_quat(self.lane_rotation());
+
+            m *= Mat4::from_translation(gp.extend((b - beat) * beat_spacing));
+            m *= Mat4::from_quat(self.get_orientation());
+
+            #[cfg(feature = "beatcraft_worldspace")]
+            {
+                m = Mat4::from_scale(Vec3::new(-1., 1., 1.)) * m * Mat4::from_scale(Vec3::new(-1., 1., 1.));
+            }
             Some((m, normal_time))
         } else {
             None
@@ -261,30 +251,31 @@ pub trait GameObject<ObjectSource> {
 
         if let Some(a) = animation {
             if let Some(BaseValue::Quaternion(q)) = a.rotation.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_quat(cfg_mirror_quat(q));
+                m *= Mat4::from_quat(q);
             }
             if let Some(BaseValue::Quaternion(q)) = a.offset_rotation.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_quat(cfg_mirror_quat(q));
+                m *= Mat4::from_quat(q);
             }
             if let Some(val) = a.definite_position.interpolate(normal_time, &data.base_provider_context) {
                 jump_vec *= Vec3::new(1., 1., 0.);
-                jump_vec += cfg_mirror_pos(val.as_vec3().unwrap());
+                jump_vec += val.as_vec3().unwrap();
             } else {
                 if let Some(val) = a.position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += cfg_mirror_pos(val.as_vec3().unwrap());
+                    jump_vec += val.as_vec3().unwrap();
                 }
                 if let Some(val) = a.offset_position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += cfg_mirror_pos(val.as_vec3().unwrap());
+                    jump_vec += val.as_vec3().unwrap();
                 }
+
                 if let Some(val) = a.local_position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += cfg_mirror_pos(val.as_vec3().unwrap() * 0.6);
+                    jump_vec += val.as_vec3().unwrap() * 0.6;
                 }
             }
         }
 
-        let jump_mat = Mat4::from_translation(cfg_mirror_pos(jump_vec));
+        let jump_mat = Mat4::from_translation(jump_vec);
 
-        m *= Mat4::from_quat(inv_cfg_mirror_quat(self.lane_rotation()));
+        m *= Mat4::from_quat(self.lane_rotation());
         m *= Mat4::from_translation(Vec3::new(0., 0.8, 1.));
         m *= jump_mat;
 
@@ -329,11 +320,18 @@ pub trait GameObject<ObjectSource> {
                 }
             }
             if let Some(val) = a.local_rotation.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_quat(cfg_mirror_quat(val.as_quat().unwrap()));
+                let q = val.as_quat().unwrap();
+                m *= Mat4::from_quat(q);
             }
         }
 
-        m *= Mat4::from_quat(cfg_mirror_quat(final_rot));
+        m *= Mat4::from_quat(final_rot);
+
+        #[cfg(feature = "beatcraft_worldspace")]
+        {
+            m = Mat4::from_scale(Vec3::new(-1., 1., 1.)) * m * Mat4::from_scale(Vec3::new(-1., 1., 1.));
+        }
+
         Some((m, normal_time))
     }
 }
@@ -437,7 +435,7 @@ pub struct NoteCustomData {
 
     pub disable_note_gravity: bool,
     pub disable_note_look: bool,
-    
+
     pub spawn_effect: Option<bool>,
     pub disable_debris: bool,
 
@@ -476,13 +474,13 @@ impl Deref for ObstacleCustomData {
 #[derive(Clone, Debug)]
 pub struct ChainCustomData {
     pub base: CustomData,
-    
+
     pub disable_note_gravity: bool,
     pub disable_note_look: bool,
-    
+
     pub spawn_effect: Option<bool>,
     pub disable_debris: bool,
-    
+
     pub tail_coordinates: OptVec2,
 }
 impl Deref for ChainCustomData {
@@ -663,8 +661,9 @@ impl<ObjectSource> GameObject<ObjectSource> for ColorNote<ObjectSource> {
         }
     }
     fn lane_rotation(&self) -> Quat {
-        self.custom_data.world_rotation *
-        Quat::from_rotation_y(-self.lane_rotation_deg.to_radians())
+        let w = self.custom_data.world_rotation;
+        Quat::from_xyzw(-w.x, w.y, w.z, -w.w) *
+            Quat::from_rotation_y(self.lane_rotation_deg.to_radians())
     }
     fn custom_njs(&self) -> Option<f32> {
         self.custom_data.custom_njs
@@ -694,8 +693,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for BombNote<ObjectSource> {
         true
     }
     fn lane_rotation(&self) -> Quat {
-        self.custom_data.world_rotation *
-        Quat::from_rotation_y(-self.lane_rotation_deg.to_radians())
+        let w = self.custom_data.world_rotation;
+        Quat::from_xyzw(-w.x, w.y, w.z, -w.w) *
+            Quat::from_rotation_y(self.lane_rotation_deg.to_radians())
     }
     fn custom_njs(&self) -> Option<f32> {
         self.custom_data.custom_njs
@@ -735,8 +735,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for Obstacle<ObjectSource> {
         self.size.z
     }
     fn lane_rotation(&self) -> Quat {
-        self.custom_data.world_rotation *
-        Quat::from_rotation_y(-self.lane_rotation_deg.to_radians())
+        let w = self.custom_data.world_rotation;
+        Quat::from_xyzw(-w.x, w.y, w.z, -w.w) *
+            Quat::from_rotation_y(self.lane_rotation_deg.to_radians())
     }
     fn custom_njs(&self) -> Option<f32> {
         self.custom_data.custom_njs
@@ -789,8 +790,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for ChainNote<ObjectSource> {
         true
     }
     fn lane_rotation(&self) -> Quat {
-        self.custom_data.world_rotation *
-        Quat::from_rotation_y(-self.head_lane_rotation_deg.to_radians())
+        let w = self.custom_data.world_rotation;
+        Quat::from_xyzw(-w.x, w.y, w.z, -w.w) *
+            Quat::from_rotation_y(self.head_lane_rotation_deg.to_radians())
     }
     fn custom_njs(&self) -> Option<f32> {
         self.custom_data.custom_njs
@@ -876,8 +878,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for ChainNoteLink<ObjectSourc
         true
     }
     fn lane_rotation(&self) -> Quat {
-        self.custom_data.world_rotation *
-        Quat::from_rotation_y(-self.lane_rotation_deg.to_radians())
+        let w = self.custom_data.world_rotation;
+        Quat::from_xyzw(-w.x, w.y, w.z, -w.w) *
+            Quat::from_rotation_y(self.lane_rotation_deg.to_radians())
     }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         self.custom_data.animation.as_ref()
