@@ -5,11 +5,10 @@ use beatmap_core_proc::hex;
 use bs_mapping_data::easing::Easing;
 use bs_mapping_data::{Color, CutDirection};
 use glam::{Mat4, Quat, Vec2, Vec3, Vec3Swizzles, Vec4, FloatExt};
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use tracks_rs::animation::track::PathPropertiesMap;
-use tracks_rs::animation::tracks_holder::TrackKey;
 use tracks_rs::base_value::BaseValue;
 use bs_mapping_data::custom_data::{OptVec2, OptVec3};
 
@@ -56,6 +55,21 @@ pub const CHAIN_LINK_HITBOX: HitBox = HitBox::new(
     Vec3::new(0.25, 0.25 * 2. / 16., 0.25),
 );
 
+#[inline]
+pub(crate) fn cfg_mirror_pos(v: Vec3) -> Vec3 {
+    if cfg!(feature = "beatcraft_worldspace") { Vec3::new(-v.x, v.y, v.z) } else { v }
+}
+
+#[inline]
+pub(crate) fn cfg_mirror_quat(q: Quat) -> Quat {
+    if cfg!(feature = "beatcraft_worldspace") { Quat::from_xyzw(-q.x, q.y, q.z, -q.w) } else { q }
+}
+
+#[inline]
+pub(crate) fn inv_cfg_mirror_quat(q: Quat) -> Quat {
+    if cfg!(feature = "beatcraft_worldspace") { q } else { Quat::from_xyzw(-q.x, q.y, q.z, -q.w) }
+}
+
 pub trait GameObject<ObjectSource> {
     fn beat(&self) -> f32;
     fn grid_pos(&self) -> Vec2;
@@ -90,6 +104,7 @@ pub trait GameObject<ObjectSource> {
     fn custom_njs_offset(&self) -> Option<f32> {
         None
     }
+    fn affected_by_scale(&self) -> bool { true }
 
     fn animation(&self) -> Option<&PathPropertiesMap> {
         None
@@ -137,15 +152,9 @@ pub trait GameObject<ObjectSource> {
 
             let gp = Vec2::new(-1.5 + gp.x, gp.y + 0.5) * 0.6;
 
-            m *= Mat4::from_quat(self.lane_rotation());
-
-            m *= Mat4::from_translation(gp.extend((b - beat) * beat_spacing));
-            m *= Mat4::from_quat(self.get_orientation());
-
-            #[cfg(feature = "beatcraft_worldspace")]
-            {
-                m = Mat4::from_scale(Vec3::new(-1., 1., 1.)) * m * Mat4::from_scale(Vec3::new(-1., 1., 1.));
-            }
+            m *= Mat4::from_quat(inv_cfg_mirror_quat(self.lane_rotation()));
+            m *= Mat4::from_translation(cfg_mirror_pos(gp.extend((b - beat) * beat_spacing)));
+            m *= Mat4::from_quat(cfg_mirror_quat(self.get_orientation()));
             Some((m, normal_time))
         } else {
             None
@@ -252,31 +261,30 @@ pub trait GameObject<ObjectSource> {
 
         if let Some(a) = animation {
             if let Some(BaseValue::Quaternion(q)) = a.rotation.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_quat(q);
+                m *= Mat4::from_quat(cfg_mirror_quat(q));
             }
             if let Some(BaseValue::Quaternion(q)) = a.offset_rotation.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_quat(q);
+                m *= Mat4::from_quat(cfg_mirror_quat(q));
             }
             if let Some(val) = a.definite_position.interpolate(normal_time, &data.base_provider_context) {
                 jump_vec *= Vec3::new(1., 1., 0.);
-                jump_vec += val.as_vec3().unwrap();
+                jump_vec += cfg_mirror_pos(val.as_vec3().unwrap());
             } else {
                 if let Some(val) = a.position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += val.as_vec3().unwrap();
+                    jump_vec += cfg_mirror_pos(val.as_vec3().unwrap());
                 }
                 if let Some(val) = a.offset_position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += val.as_vec3().unwrap();
+                    jump_vec += cfg_mirror_pos(val.as_vec3().unwrap());
                 }
-
                 if let Some(val) = a.local_position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += val.as_vec3().unwrap() * 0.6;
+                    jump_vec += cfg_mirror_pos(val.as_vec3().unwrap() * 0.6);
                 }
             }
         }
 
-        let jump_mat = Mat4::from_translation(jump_vec);
+        let jump_mat = Mat4::from_translation(cfg_mirror_pos(jump_vec));
 
-        m *= Mat4::from_quat(self.lane_rotation());
+        m *= Mat4::from_quat(inv_cfg_mirror_quat(self.lane_rotation()));
         m *= Mat4::from_translation(Vec3::new(0., 0.8, 1.));
         m *= jump_mat;
 
@@ -315,22 +323,17 @@ pub trait GameObject<ObjectSource> {
         };
 
         if let Some(a) = animation {
-            if let Some(val) = a.scale.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_scale(val.as_vec3().unwrap())
+            if self.affected_by_scale() {
+                if let Some(val) = a.scale.interpolate(normal_time, &data.base_provider_context) {
+                    m *= Mat4::from_scale(val.as_vec3().unwrap()); // scale is unchanged by a mirror
+                }
             }
             if let Some(val) = a.local_rotation.interpolate(normal_time, &data.base_provider_context) {
-                let q = val.as_quat().unwrap();
-                m *= Mat4::from_quat(q);
+                m *= Mat4::from_quat(cfg_mirror_quat(val.as_quat().unwrap()));
             }
         }
 
-        m *= Mat4::from_quat(final_rot);
-
-        #[cfg(feature = "beatcraft_worldspace")]
-        {
-            m = Mat4::from_scale(Vec3::new(-1., 1., 1.)) * m * Mat4::from_scale(Vec3::new(-1., 1., 1.));
-        }
-
+        m *= Mat4::from_quat(cfg_mirror_quat(final_rot));
         Some((m, normal_time))
     }
 }
@@ -412,7 +415,6 @@ pub enum ObjectType {
 }
 
 
-
 #[derive(Clone)]
 pub struct CustomData {
     pub custom_njs_offset: Option<f32>,
@@ -423,7 +425,13 @@ pub struct CustomData {
     pub animation: Option<PathPropertiesMap>,
     // pub track: Option<TrackKey>,
 }
+impl std::fmt::Debug for CustomData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CustomData {{ ... }}")
+    }
+}
 
+#[derive(Debug)]
 pub struct NoteCustomData {
     pub base: CustomData,
 
@@ -441,6 +449,7 @@ impl Deref for NoteCustomData {
     }
 }
 
+#[derive(Debug)]
 pub struct BombCustomData {
     pub base: CustomData,
 
@@ -453,6 +462,7 @@ impl Deref for BombCustomData {
     }
 }
 
+#[derive(Debug)]
 pub struct ObstacleCustomData {
     pub base: CustomData,
 }
@@ -463,7 +473,7 @@ impl Deref for ObstacleCustomData {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ChainCustomData {
     pub base: CustomData,
     
@@ -482,6 +492,7 @@ impl Deref for ChainCustomData {
     }
 }
 
+#[derive(Debug)]
 pub struct ArcCustomData {
     pub base: CustomData,
 }
@@ -492,6 +503,7 @@ impl Deref for ArcCustomData {
     }
 }
 
+#[derive(Debug)]
 pub struct ColorNote<ObjectSource> {
     pub spawn_orientation: Quat,
     pub beat: f32,
@@ -508,6 +520,7 @@ pub struct ColorNote<ObjectSource> {
     pub source: ObjectSource,
 }
 
+#[derive(Debug)]
 pub struct BombNote<ObjectSource> {
     pub beat: f32,
     pub color: ObjectColor<Self>,
@@ -530,6 +543,7 @@ impl<ObjectSource> ColorableObject for BombNote<ObjectSource> {
     }
 }
 
+#[derive(Debug)]
 pub struct Obstacle<ObjectSource> {
     pub beat: f32,
     pub color: ObjectColor<Self>,
@@ -561,6 +575,7 @@ pub struct ChainNoteLinkData {
     pub index: u32,
 }
 
+#[derive(Debug)]
 pub struct ChainNote<ObjectSource> {
     pub spawn_orientation: Quat,
     pub head_beat: f32,
@@ -581,6 +596,7 @@ pub struct ChainNote<ObjectSource> {
     pub source: ObjectSource,
 }
 
+#[derive(Debug)]
 pub struct ChainNoteLink<ObjectSource> {
     pub grid_pos: Vec2,
     pub beat: f32,
@@ -596,6 +612,7 @@ pub struct ChainNoteLink<ObjectSource> {
     pub _source: PhantomData<ObjectSource>,
 }
 
+#[derive(Debug)]
 pub struct Arc<ObjectSource> {
     pub head_beat: f32,
     pub tail_beat: f32,
@@ -622,8 +639,7 @@ impl<ObjectSource> GameObject<ObjectSource> for ColorNote<ObjectSource> {
         self.grid_pos
     }
     fn get_orientation(&self) -> Quat {
-        self.custom_data.world_rotation *
-            self.custom_data.local_rotation *
+        self.custom_data.local_rotation *
             self.cut_direction.to_quat() *
             Quat::from_rotation_z(self.angle_offset_deg.to_radians())
     }
@@ -669,7 +685,7 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for BombNote<ObjectSource> {
         self.grid_pos
     }
     fn get_orientation(&self) -> Quat {
-        self.custom_data.world_rotation * self.custom_data.local_rotation
+        self.custom_data.local_rotation
     }
     fn do_gravity(&self) -> bool {
         !self.custom_data.disable_note_gravity
@@ -707,10 +723,10 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for Obstacle<ObjectSource> {
         base
     }
     fn get_orientation(&self) -> Quat {
-        self.custom_data.world_rotation * self.custom_data.local_rotation
+        self.custom_data.local_rotation
     }
     fn spawn_orientation(&self) -> Quat {
-        self.custom_data.world_rotation * self.custom_data.local_rotation
+        self.custom_data.local_rotation
     }
     fn duration(&self) -> f32 {
         self.duration
@@ -727,6 +743,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for Obstacle<ObjectSource> {
     }
     fn custom_njs_offset(&self) -> Option<f32> {
         self.custom_data.custom_njs_offset
+    }
+    fn affected_by_scale(&self) -> bool {
+        false
     }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         self.custom_data.animation.as_ref()

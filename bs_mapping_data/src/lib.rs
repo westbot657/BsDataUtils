@@ -134,6 +134,21 @@ pub enum MapCharacteristic {
     Unknown(String),
 }
 
+impl MapCharacteristic {
+    pub fn iter_known() -> impl IntoIterator<Item = Self> {
+        [
+            Self::Standard,
+            Self::NoArrows,
+            Self::OneSaber,
+            Self::Degree360,
+            Self::Degree90,
+            Self::Legacy,
+            Self::Lawless,
+            Self::Lightshow,
+        ].into_iter()
+    }
+}
+
 #[cfg_attr(feature = "debug", derive(Debug))]
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MapDifficulty {
@@ -145,6 +160,18 @@ pub enum MapDifficulty {
 
     #[serde(untagged)]
     Unknown(String),
+}
+
+impl MapDifficulty {
+    pub fn iter_known() -> impl IntoIterator<Item = Self> {
+        [
+            Self::Easy,
+            Self::Normal,
+            Self::Hard,
+            Self::Expert,
+            Self::ExpertPlus,
+        ].into_iter()
+    }
 }
 
 macro_rules! environment_enum {
