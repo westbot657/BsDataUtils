@@ -8,8 +8,10 @@ use glam::{Mat4, Quat, Vec2, Vec3, Vec3Swizzles, Vec4, FloatExt};
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
-use tracks_rs::animation::track::PathPropertiesMap;
+use tracks_rs::animation::track::{PathPropertiesMap, Track};
+use tracks_rs::animation::tracks_holder::{TrackKey, TracksHolder};
 use tracks_rs::base_value::BaseValue;
+use tracks_rs::prelude::BaseProviderContext;
 use bs_mapping_data::custom_data::{OptVec2, OptVec3};
 
 pub trait CutDirectionExt {
@@ -55,6 +57,126 @@ pub const CHAIN_LINK_HITBOX: HitBox = HitBox::new(
     Vec3::new(0.25, 0.25 * 2. / 16., 0.25),
 );
 
+pub struct TrackList<'t> {
+    tracks: Vec<&'t Track>,
+    animation: Option<&'t PathPropertiesMap>,
+}
+
+macro_rules! read_track {
+    (both: $self:ident, $lifetime:ident, $ctx:ident, $attr:ident, $typ:ident, $op:tt) => {
+        let mut out = None;
+        for &t in $self.tracks.iter() {
+            if let Some(BaseValue::$typ(v)) = t.properties.$attr.get_value() {
+                match &mut out {
+                    Some(x) => *x $op v,
+                    None => out = Some(v),
+                };
+            }
+            if let Some(BaseValue::$typ(v)) = t.path_properties.$attr.interpolate($lifetime, $ctx) {
+                match &mut out {
+                    Some(x) => *x $op v,
+                    None => out = Some(v),
+                };
+            }
+        }
+        if let Some(anim) = $self.animation
+            && let Some(BaseValue::$typ(v)) = anim.$attr.interpolate($lifetime, $ctx)
+        {
+            match &mut out {
+                Some(x) => *x $op v,
+                None => out = Some(v),
+            };
+        }
+        out
+    };
+    (prop: $self:ident, $attr:ident, $typ:ident, $op:tt) => {
+        let mut out = None;
+        for &t in $self.tracks.iter() {
+            if let Some(BaseValue::$typ(v)) = t.properties.$attr.get_value() {
+                match &mut out {
+                    Some(x) => *x $op v,
+                    None => out = Some(v),
+                };
+            }
+        }
+        out
+    };
+    (path: $self:ident, $lifetime:ident, $ctx:ident, $attr:ident, $typ:ident, $op:tt) => {
+        let mut out = None;
+        for &t in $self.tracks.iter() {
+            if let Some(BaseValue::$typ(v)) = t.path_properties.$attr.interpolate($lifetime, $ctx) {
+                match &mut out {
+                    Some(x) => *x $op v,
+                    None => out = Some(v),
+                };
+            }
+        }
+        if let Some(anim) = $self.animation
+            && let Some(BaseValue::$typ(v)) = anim.$attr.interpolate($lifetime, $ctx)
+        {
+            match &mut out {
+                Some(x) => *x $op v,
+                None => out = Some(v),
+            };
+        }
+        out
+    };
+}
+
+impl<'t> TrackList<'t> {
+    pub fn from_track_keys(keys: &[TrackKey], tracks_holder: &'t TracksHolder, animation: Option<&'t PathPropertiesMap>) -> TrackList<'t> {
+        Self {
+            tracks: keys
+                .iter()
+                .filter_map(|k| tracks_holder.get_track(*k))
+                .collect(),
+            animation,
+        }
+    }
+
+    pub fn get_time(&self) -> Option<f32> {
+        for &t in self.tracks.iter() {
+            if let Some(BaseValue::Float(t)) = t.properties.time.get_value() {
+                return Some(t)
+            }
+        }
+        None
+    }
+    pub fn get_rotation(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Quat> {
+        read_track! { both: self, lifetime, ctx, rotation, Quaternion, *= }
+    }
+    pub fn get_offset_rotation(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Quat> {
+        read_track! { both: self, lifetime, ctx, offset_rotation, Quaternion, *= }
+    }
+    pub fn get_definite_position(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Vec3> {
+        read_track! { path: self, lifetime, ctx, definite_position, Vector3, += }
+    }
+    pub fn get_position(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Vec3> {
+        read_track! { both: self, lifetime, ctx, position, Vector3, += }
+    }
+    pub fn get_offset_position(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Vec3> {
+        read_track! { both: self, lifetime, ctx, offset_position, Vector3, += }
+    }
+    pub fn get_local_position(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Vec3> {
+        read_track! { both: self, lifetime, ctx, local_position, Vector3, += }
+    }
+    pub fn get_scale(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Vec3> {
+        read_track! { both: self, lifetime, ctx, scale, Vector3, *= }
+    }
+    pub fn get_local_rotation(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Quat> {
+        read_track! { both: self, lifetime, ctx, local_rotation, Quaternion, *= }
+    }
+    pub fn get_color(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<Vec4> {
+        read_track! { both: self, lifetime, ctx, color, Vector4, *= }
+    }
+    pub fn get_dissolve(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<f32> {
+        read_track! { both: self, lifetime, ctx, dissolve, Float, *= }
+    }
+    pub fn get_arrow_dissolve(&self, lifetime: f32, ctx: &BaseProviderContext) -> Option<f32> {
+        read_track! { both: self, lifetime, ctx, dissolve_arrow, Float, *= }
+    }
+}
+
 pub trait GameObject<ObjectSource> {
     fn beat(&self) -> f32;
     fn grid_pos(&self) -> Vec2;
@@ -94,6 +216,9 @@ pub trait GameObject<ObjectSource> {
     }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         None
+    }
+    fn tracks(&self) -> &[TrackKey] {
+        &[]
     }
     fn upcast_chain_head(&self) -> Option<&ChainNote<ObjectSource>> {
         None
@@ -208,10 +333,13 @@ pub trait GameObject<ObjectSource> {
         if !(s_ext..d_ext).contains(&beat) {
             return None;
         }
-        let animation = self.animation();
+
+        let tracks = TrackList::from_track_keys(self.tracks(), &data.tracks_holder, self.animation());
+
         let s_time_beat = data.seconds_to_beat(s_time);
         let d_time_beat = data.seconds_to_beat(d_time);
         let normal_time = f32::inverse_lerp(s_time_beat, d_time_beat, beat).clamp(0., 1.);
+        let normal_time = tracks.get_time().unwrap_or(normal_time);
         if !normal_time.is_finite() {
             eprintln!("erroneous time value: {normal_time} ({s_time_beat}..{d_time_beat} : {beat}) ({s_time}..{d_time})")
         }
@@ -249,29 +377,29 @@ pub trait GameObject<ObjectSource> {
 
         let mut jump_vec = Vec3::new(gp.x, y, z);
 
-        if let Some(a) = animation {
-            if let Some(BaseValue::Quaternion(q)) = a.rotation.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_quat(q);
-            }
-            if let Some(BaseValue::Quaternion(q)) = a.offset_rotation.interpolate(normal_time, &data.base_provider_context) {
-                m *= Mat4::from_quat(q);
-            }
-            if let Some(val) = a.definite_position.interpolate(normal_time, &data.base_provider_context) {
-                jump_vec *= Vec3::new(1., 1., 0.);
-                jump_vec += val.as_vec3().unwrap();
-            } else {
-                if let Some(val) = a.position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += val.as_vec3().unwrap();
-                }
-                if let Some(val) = a.offset_position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += val.as_vec3().unwrap();
-                }
 
-                if let Some(val) = a.local_position.interpolate(normal_time, &data.base_provider_context) {
-                    jump_vec += val.as_vec3().unwrap() * 0.6;
-                }
+        if let Some(q) = tracks.get_rotation(normal_time, &data.base_provider_context) {
+            m *= Mat4::from_quat(q);
+        }
+        if let Some(q) = tracks.get_offset_rotation(normal_time, &data.base_provider_context) {
+            m *= Mat4::from_quat(q);
+        }
+        if let Some(val) = tracks.get_definite_position(normal_time, &data.base_provider_context) {
+            jump_vec *= Vec3::new(1., 1., 0.);
+            jump_vec += val;
+        } else {
+            if let Some(val) = tracks.get_position(normal_time, &data.base_provider_context) {
+                jump_vec += val;
+            }
+            if let Some(val) = tracks.get_offset_position(normal_time, &data.base_provider_context) {
+                jump_vec += val;
+            }
+
+            if let Some(val) = tracks.get_local_position(normal_time, &data.base_provider_context) {
+                jump_vec += val * 0.6;
             }
         }
+
 
         let jump_mat = Mat4::from_translation(jump_vec);
 
@@ -313,16 +441,13 @@ pub trait GameObject<ObjectSource> {
             base_rot
         };
 
-        if let Some(a) = animation {
-            if self.affected_by_scale() {
-                if let Some(val) = a.scale.interpolate(normal_time, &data.base_provider_context) {
-                    m *= Mat4::from_scale(val.as_vec3().unwrap()); // scale is unchanged by a mirror
-                }
+        if self.affected_by_scale() {
+            if let Some(val) = tracks.get_scale(normal_time, &data.base_provider_context) {
+                m *= Mat4::from_scale(val);
             }
-            if let Some(val) = a.local_rotation.interpolate(normal_time, &data.base_provider_context) {
-                let q = val.as_quat().unwrap();
-                m *= Mat4::from_quat(q);
-            }
+        }
+        if let Some(val) = tracks.get_local_rotation(normal_time, &data.base_provider_context) {
+            m *= Mat4::from_quat(val);
         }
 
         m *= Mat4::from_quat(final_rot);
@@ -421,7 +546,7 @@ pub struct CustomData {
     pub world_rotation: Quat,
     pub coordinates: OptVec3,
     pub animation: Option<PathPropertiesMap>,
-    // pub track: Option<TrackKey>,
+    pub tracks: Vec<TrackKey>,
 }
 impl std::fmt::Debug for CustomData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -674,6 +799,9 @@ impl<ObjectSource> GameObject<ObjectSource> for ColorNote<ObjectSource> {
     fn animation(&self) -> Option<&PathPropertiesMap> {
         self.custom_data.animation.as_ref()
     }
+    fn tracks(&self) -> &[TrackKey] {
+        &self.custom_data.tracks
+    }
 }
 
 impl<ObjectSource: Debug> GameObject<ObjectSource> for BombNote<ObjectSource> {
@@ -705,6 +833,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for BombNote<ObjectSource> {
     }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         self.custom_data.animation.as_ref()
+    }
+    fn tracks(&self) -> &[TrackKey] {
+        &self.custom_data.tracks
     }
 }
 
@@ -750,6 +881,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for Obstacle<ObjectSource> {
     }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         self.custom_data.animation.as_ref()
+    }
+    fn tracks(&self) -> &[TrackKey] {
+        &self.custom_data.tracks
     }
     fn editor_hitbox(&self, beat_spacing: Option<f32>) -> HitBox {
         let z = if let Some(bs) = beat_spacing
@@ -802,6 +936,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for ChainNote<ObjectSource> {
     }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         self.custom_data.animation.as_ref()
+    }
+    fn tracks(&self) -> &[TrackKey] {
+        &self.custom_data.tracks
     }
     fn upcast_chain_head(&self) -> Option<&ChainNote<ObjectSource>> {
         Some(self)
@@ -884,6 +1021,9 @@ impl<ObjectSource: Debug> GameObject<ObjectSource> for ChainNoteLink<ObjectSourc
     }
     fn animation(&self) -> Option<&PathPropertiesMap> {
         self.custom_data.animation.as_ref()
+    }
+    fn tracks(&self) -> &[TrackKey] {
+        &self.custom_data.tracks
     }
     fn editor_hitbox(&self, _bs: Option<f32>) -> HitBox {
         CHAIN_LINK_HITBOX
